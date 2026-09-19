@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+"""ncafe — anonymous Naver Cafe search CLI.
+
+Wraps Naver's cafe-search surfaces (article search + cafe-name search with
+descriptions) with zero accounts, zero API keys. Engines:
+
+  1. ssearch  s.search.naver.com/p/cafe/48/search.naver XHR (JSON w/ embedded
+              HTML fragments) — the page's own infinite-scroll endpoint.
+  2. www      search.naver.com/search.naver SSR HTML — same params, always
+              served, used as fallback when the XHR path soft-blocks.
+
+Verified 2026-09-19 (see KNOWHOW.md):
+  - anonymous access works with an honest UA (no cookies)
+  - params: cafe_where='' (all articles) | 'cafe' (cafe names+descriptions)
+            | 'articleg' (general) | 'articlec' (trade)
+            st=rel|date   date_option=0 all,1 1h,2 1d,3 1w,4 1mo,5 3mo,6 6mo,7 1y
+  - display is IGNORED (always 30/page); start works on the XHR only when the
+    browser-issued nlu_query accompanies it — the CLI cannot synthesize that,
+    so each invocation returns one page of ~30 items. Documented, not hidden.
+  - soft rate-limit = HTTP 200 with EMPTY body; recover in ~8-12s.
+
+Contract: any2cli (formats table|json|jsonl|md, exit 0/2/3/4, disk cache+throttle).
+"""
+import argparse
+import hashlib
+import html as htmlmod
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "0.1.0"
+UA = "ncafe/" + VERSION + " (anonymous naver-cafe search wrapper; personal research; no account)"
+TOOL = "ncafe"
+CACHE_DIR = os.path.expanduser("~/.cache/any2cli/" + TOOL)
+THROTTLE_FILE = os.path.join(CACHE_DIR, "throttle.json")
+MIN_INTERVAL = 6.0  # seconds between hits to *.search.naver.com (soft RL is ~1 burst)
+
+HOSTS = ["s.search.naver.com", "search.naver.com"]
+
+
+def log(msg):
+    print("[ncafe] " + msg, file=sys.stderr)
+
+
+# ---------------------------------------------------------------- utilities
+def disk_state(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def throttle_wait(host):
+    """Min-interval per host, persisted on disk so consecutive runs comply."""
+    if os.environ.get("NCAFE_NO_THROTTLE"):
+        return
+    state = disk_state(THROTTLE_FILE, {})
+    last = state.get(host, 0)
+    wait = MIN_INTERVAL - (time.time() - last)
+    if wait > 0:
+        wait = min(wait * 1.1, 25.0)  # jitter, cap
+        if os.environ.get("NCAFE_VERBOSE"):
+            log("throttle: sleeping %.1fs for %s" % (wait, host))
+        time.sleep(wait)
+    state[host] = time.time()
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(THROTTLE_FILE, "w") as f:
+        json.dump(state, f)
+
+
+def cache_get(url, ttl):
+    key = hashlib.sha256(url.encode()).hexdigest()
+    path = os.path.join(CACHE_DIR, key + ".json")
+    if ttl <= 0 or os.environ.get("NCAFE_FRESH"):
+        return None
+    try:
+        with open(path) as f:
+            blob = json.load(f)
+        if time.time() - blob["ts"] <= ttl:
+            if os.environ.get("NCAFE_VERBOSE"):
+                log("cache hit: " + url[:90])
+            return blob["body"]
+    except Exception:
+        pass
+    return None
+
+
+def cache_put(url, body):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    key = hashlib.sha256(url.encode()).hexdigest()
+    path = os.path.join(CACHE_DIR, key + ".json")
+    try:
+        with open(path, "w") as f:
+            json.dump({"ts": time.time(), "url": url, "body": body}, f)
+    except Exception:
+        pass
+
+
+class Blocked(Exception):
+    pass
+
+
+class NotFound(Exception):
+    pass
+
+
+def http_get(url, ttl=300):
+    body = cache_get(url, ttl)
+    if body is not None:
+        return body
+    host = urllib.parse.urlparse(url).netloc
+    throttle_wait(host)
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=25) as r:
+                body = r.read().decode("utf-8", "replace")
+            if not body.strip():
+                # Naver soft rate-limit: 200 + empty body.
+                raise Blocked("200 with empty body (soft rate-limit)")
+            cache_put(url, body)
+            return body
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise NotFound(url)
+            if e.code in (429, 403):
+                raise Blocked("HTTP %d" % e.code)
+            if attempt == 2:
+                raise
+            time.sleep(2 * (attempt + 1))
+        except Blocked:
+            if attempt == 2:
+                raise
+            time.sleep(9)  # soft-RL recovery window observed ~8-12s
+    raise Blocked("unreachable: " + url)
+
+
+def strip_tags(s):
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = htmlmod.unescape(s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+# ---------------------------------------------------------------- engines
+def build_params(query, where, sort, date_option, start):
+    p = {
+        "query": query,
+        "display": "30",
+        "start": str(start),
+        "st": sort,
+        "ssc": "tab.cafe.all",
+        "cafe_where": where,
+        "date_option": str(date_option),
+        "date_from": "",
+        "date_to": "",
+        "nx_and_query": "",
+        "nx_search_query": "",
+        "nx_sub_query": "",
+    }
+    return p
+
+
+def engine_ssearch(params):
+    qs = urllib.parse.urlencode(params)
+    url = "https://s.search.naver.com/p/cafe/48/search.naver?" + qs
+    body = http_get(url, ttl=300)
+    try:
+        data = json.loads(body)
+    except ValueError:
+        raise Blocked("ssearch returned non-JSON")
+    htmls = []
+    for sec in data.get("result", {}).get("section", []):
+        htmls.append(sec.get("html", ""))
+    for coll in data.get("collection", []):
+        htmls.append(coll.get("html", ""))
+    return "\n".join(htmls)
+
+
+def engine_www(params):
+    p = dict(params)
+    p.pop("display", None)
+    qs = urllib.parse.urlencode(p)
+    url = "https://search.naver.com/search.naver?" + qs
+    body = http_get(url, ttl=300)
+    if "title_link" not in body and "cafe_head_inner" not in body:
+        raise Blocked("www page has no result markup")
+    return body
+
+
+def fetch_html(query, where, sort, date_option, start):
+    """Try engines in order; log switches. Returns (html, engine)."""
+    params = build_params(query, where, sort, date_option, start)
+    errs = []
+    for name, fn in (("ssearch", engine_ssearch), ("www", engine_www)):
+        try:
+            return fn(params), name
+        except (Blocked, NotFound) as e:
+            errs.append("%s: %s" % (name, e))
+            log("engine %s failed (%s); falling back" % (name, e))
+    raise Blocked("; ".join(errs))
+
+
+# ---------------------------------------------------------------- parsing
+def parse_articles(html):
+    """Article rows: title, url, cafe name, cafe url, date str, snippet."""
+    items = []
+    blocks = re.split(r'<li class="bx', html)[1:]
+    for b in blocks:
+        m = re.search(r'<a href="(https://cafe\.naver\.com/[^"]+?)" class="title_link"[^>]*>(.*?)</a>', b, re.S)
+        if not m:
+            continue
+        href, title = m.group(1), strip_tags(m.group(2))
+        cafe = re.search(r'class="name"[^>]*>([^<]+)', b)
+        cafe_url = re.search(r'href="(https://cafe\.naver\.com/[A-Za-z0-9_]+)"', b)
+        date = re.search(r'<span class="sub">([^<]*)</span>', b)
+        dsc = re.search(r'class="dsc_link"[^>]*>(.*?)</a>', b, re.S)
+        thumb = "thumb" in b
+        rep = 'api_ico_total' in b  # 대표(official) cafe badge
+        # strip tracking decorations from article url
+        clean = href.split("?")[0]
+        items.append({
+            "id": clean.rstrip("/").split("/")[-1],
+            "title": title,
+            "url": clean,
+            "cafe": strip_tags(cafe.group(1)) if cafe else None,
+            "cafe_url": cafe_url.group(1) if cafe_url else None,
+            "date": date.group(1).strip() if date else None,
+            "snippet": strip_tags(dsc.group(1))[:300] if dsc else None,
+            "thumb": thumb,
+            "official": rep,
+        })
+    # de-dup (rank rerenders can repeat)
+    seen = set()
+    out = []
+    for it in items:
+        if it["id"] in seen:
+            continue
+        seen.add(it["id"])
+        out.append(it)
+    return out
+
+
+def parse_cafes(html):
+    """Cafe-name rows: name, url, member count, rank tier, new posts, total posts, description."""
+    items = []
+    blocks = re.split(r'<li class="bx', html)[1:]
+    for b in blocks:
+        m = re.search(r'href="(https://cafe\.naver\.com/[A-Za-z0-9_]+)"', b)
+        if not m or 'name_area' not in b:
+            continue
+        name = re.search(r'<span class="txt">(.*?)</span>', b, re.S)
+        dsc = re.search(r'<p class="dsc">(.*?)</p>', b, re.S)
+        mem = re.search(r'멤버수</span><span class="info">([\d,]+)</span>', b)
+        rank = re.search(r'카페랭킹</span><span class="info">([^<]*)</span>', b)
+        newp = re.search(r'새글수</span><span class="info">([\d,]+)</span>', b)
+        total = re.search(r'전체글수</span><span class="info">([\d,]+)</span>', b)
+
+        def num(g):
+            return int(g.group(1).replace(",", "")) if g else None
+
+        items.append({
+            "id": m.group(1).rstrip("/").split("/")[-1],
+            "name": strip_tags(name.group(1)) if name else None,
+            "url": m.group(1),
+            "members": num(mem),
+            "rank_tier": rank.group(1).strip() if rank else None,
+            "new_posts": num(newp),
+            "total_posts": num(total),
+            "description": strip_tags(dsc.group(1)) if dsc else None,
+        })
+    seen = set()
+    out = []
+    for it in items:
+        if it["id"] in seen:
+            continue
+        seen.add(it["id"])
+        out.append(it)
+    return out
+
+
+# ---------------------------------------------------------------- output
+def out_table_articles(items):
+    lines = []
+    for it in items:
+        cafe = (it["cafe"] or "?")[:18]
+        mark = "*" if it["official"] else " "
+        lines.append("%s %-42s %-18s %-8s %s" % (
+            mark, trunc(it["title"], 42), cafe, it["date"] or "·",
+            (it["snippet"] or "")[:56]))
+    return lines
+
+
+def out_table_cafes(items):
+    lines = []
+    for it in items:
+        lines.append("%-30s %10s %-8s %8s %s" % (
+            trunc(it["name"] or "?", 30), fmt_int(it["members"]),
+            it["rank_tier"] or "·", fmt_int(it["new_posts"]),
+            trunc(it["description"] or "", 50)))
+    return lines
+
+
+def trunc(s, n):
+    s = s or ""
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def fmt_int(v):
+    return format(v, ",") if v is not None else "·"
+
+
+def emit(kind, items, engine, fmt, extra=None):
+    if fmt == "json":
+        payload = {"count": len(items), "engine": engine, "items": items}
+        if extra:
+            payload.update(extra)
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif fmt == "jsonl":
+        for it in items:
+            print(json.dumps(it, ensure_ascii=False))
+    elif fmt == "md":
+        if kind == "cafe":
+            for it in items:
+                print("- **%s** (%s members, tier %s) — %s\n  %s" % (
+                    it["name"], fmt_int(it["members"]), it["rank_tier"] or "-",
+                    it["url"], it["description"] or ""))
+        else:
+            for it in items:
+                print("- %s — %s (%s, %s)\n  %s" % (
+                    it["title"], it["cafe"], it["date"], it["url"],
+                    (it["snippet"] or "")[:120]))
+    else:
+        lines = out_table_cafes(items) if kind == "cafe" else out_table_articles(items)
+        for ln in lines:
+            print(ln)
+        print("engine: %s · %d items" % (engine, len(items)))
+
+
+# ---------------------------------------------------------------- main
+def main(argv):
+    ap = argparse.ArgumentParser(
+        prog=TOOL,
+        description="Anonymous Naver Cafe search (articles + cafe finder).",
+        epilog="""examples:
+  ncafe search 캠핑                              # articles, all cafes, relevance
+  ncafe search 캠핑 --sort date                  # newest first
+  ncafe search 캠핑 --date week                  # last week
+  ncafe search 텐트추천 --where trade            # trade articles only
+  ncafe cafes 레트로게임                         # find cafes by name+description
+  ncafe cafes 캠핑 --format json                 # machine-readable
+""")
+    ap.add_argument("--version", action="version", version="%(prog)s " + VERSION)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p1 = sub.add_parser("search", help="search cafe ARTICLES across all naver cafes")
+    p1.add_argument("query")
+    p1.add_argument("--where", choices=["all", "general", "trade"], default="all",
+                    help="article type: all | general(일반글) | trade(거래글)")
+    p1.add_argument("--sort", choices=["rel", "date"], default="rel")
+    p1.add_argument("--date", choices=["all", "hour", "day", "week", "month", "quarter", "half", "year"],
+                    default="all", help="date_option mapping")
+    p1.add_argument("--start", type=int, default=1, help="result offset (works on some sessions; often repeats p1)")
+    p1.add_argument("--limit", type=int, default=30)
+    p1.add_argument("--format", "--output-format", dest="fmt", choices=["table", "json", "jsonl", "md"],
+                    default=None)
+
+    p2 = sub.add_parser("cafes", help="find CAFES by name + description (+members/tier/posts)")
+    p2.add_argument("query")
+    p2.add_argument("--sort", choices=["rel", "date"], default="rel")
+    p2.add_argument("--limit", type=int, default=30)
+    p2.add_argument("--format", "--output-format", dest="fmt", choices=["table", "json", "jsonl", "md"],
+                    default=None)
+
+    for p in (p1, p2):
+        p.add_argument("--fresh", action="store_true", help="bypass cache")
+        p.add_argument("--cache-ttl", type=int, default=300)
+
+    args = ap.parse_args(argv)
+    if args.fresh:
+        os.environ["NCAFE_FRESH"] = "1"
+    # ttl plumbed via env to keep http_get signature simple
+    os.environ.setdefault("NCAFE_TTL", str(getattr(args, "cache_ttl", 300)))
+
+    fmt = args.fmt or ("table" if sys.stdout.isatty() else "json")
+
+    date_map = {"all": 0, "hour": 1, "day": 2, "week": 3, "month": 4,
+                "quarter": 5, "half": 6, "year": 7}
+    where_map = {"all": "", "general": "articleg", "trade": "articlec"}
+
+    try:
+        if args.cmd == "search":
+            html, engine = fetch_html(args.query, where_map[args.where], args.sort,
+                                      date_map[args.date], args.start)
+            items = parse_articles(html)
+            emit("article", items[: args.limit], engine, fmt,
+                 extra={"query": args.query, "where": args.where, "sort": args.sort,
+                        "date": args.date, "note": "one page per invocation (~30 items); naver ignores display/start without browser session tokens"})
+            if not items:
+                sys.exit(4)
+        else:
+            html, engine = fetch_html(args.query, "cafe", args.sort, 0, 1)
+            items = parse_cafes(html)
+            emit("cafe", items[: args.limit], engine, fmt,
+                 extra={"query": args.query, "note": "ranked by relevance; includes cafe description"})
+            if not items:
+                sys.exit(4)
+    except Blocked as e:
+        log("blocked: %s" % e)
+        sys.exit(3)
+    except NotFound:
+        log("not found")
+        sys.exit(4)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
