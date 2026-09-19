@@ -1,0 +1,6 @@
+# build artifacts (rebuild with examples/reddit/build.sh)
+dist/
+# python
+__pycache__/
+*.pyc
+.DS_Store

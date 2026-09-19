@@ -1,0 +1,1811 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""reddit — anonymous read-only Reddit CLI (any2cli worked example).
+
+Everything a logged-out user can see on reddit.com, from your shell:
+
+  reddit posts r/python                    hot listing with upvote scores
+  reddit posts r/python --sort top --time week
+  reddit search "playwright scraping"      site-wide post search
+  reddit search asyncio --sub python       search inside one subreddit
+  reddit subs python                       find subreddits by name
+  reddit post 1w78kp5                      one post: score, ratio, selftext
+  reddit comments 1w78kp5                  comment tree with scores
+  reddit user spez                         a user's posts/comments
+
+Design (anonymous, no account, no API key) — three engines, one interface:
+  engine redlib  community mirror (default: redlib.ducks.party) rendering
+                 reddit pages as plain HTML. LIVE scores, search, comment
+                 trees, user pages, pagination. Mirrors are volunteer-run
+                 and volatile — override with ANY2CLI_REDLIB_URLS.
+  engine rss     www.reddit.com Atom feeds — fresh first-party listings,
+                 search, comments, user feeds. Heavily rate limited (429s):
+                 throttled, cached, retried with Retry-After.
+  engine arctic  arctic-shift.photon-reddit.com archive — exact post lookup
+                 by id, comment trees, author history, keyword fallback.
+                 Scores are archive-time snapshots. pullpush.io adds a
+                 second archive for id lookups (near-real-time ingest).
+  default        redlib → rss(+arctic score enrichment) → arctic, switched
+                 automatically on failure; --engine forces one.
+
+Output: table when stdout is a TTY, JSON when piped (agent-friendly).
+Override with --format. Exit codes: 0 ok · 2 usage · 3 rate-limited/blocked
+· 4 not found · 1 other error.
+
+Python 3.8+ standard library only.
+"""
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import random
+import re
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
+
+VERSION = "1.1.0"
+RSS_BASE = "https://www.reddit.com"
+ARCTIC_BASE = "https://arctic-shift.photon-reddit.com/api"
+PULLPUSH_BASE = "https://api.pullpush.io/reddit/search"
+UA = "any2cli-reddit/%s (read-only CLI by/for one human; anonymous)" % VERSION
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "any2cli", "reddit")
+ARCTIC_IDS_BATCH = 100
+
+ATOM = "{http://www.w3.org/2005/Atom}"
+REDDIT_SORTS = ["hot", "new", "top", "rising", "controversial"]
+SEARCH_SORTS = ["relevance", "hot", "top", "new", "comments"]
+TIME_FILTERS = ["hour", "day", "week", "month", "year", "all"]
+COMMENT_SORTS = ["best", "top", "new", "controversial", "old"]
+
+# Community mirror instances, most-trusted first. Override with
+# ANY2CLI_REDLIB_URLS="https://a.example,https://b.example" (comma separated).
+REDLIB_DEFAULT = "https://redlib.ducks.party"
+
+# Optional OAuth engine (best data: live scores + ratios, 1000 req/10min).
+# App-only, still anonymous (no user account): set ANY2CLI_REDDIT_CLIENT_ID
+# (+ ANY2CLI_REDDIT_CLIENT_SECRET for confidential apps). See KNOWHOW.md §5
+# for the verified grant flow and the shared-bucket caveats.
+OAUTH_BASE = "https://oauth.reddit.com"
+
+# Pages that look like this in <title> are bot-walls even with HTTP 200.
+REDLIB_BLOCK_MARKERS = ("not a bot", "oh noes", "just a moment",
+                        "verifying your browser", "making sure",
+                        "access denied")
+
+MIN_INTERVAL = {"rss": 8.0, "arctic": 1.0, "redlib": 1.5, "pullpush": 1.5,
+                "oauth": 0.5}
+MAX_THROTTLE_WAIT = 25.0  # never sleep longer than this for politeness
+
+
+def redlib_instances():
+    env = os.environ.get("ANY2CLI_REDLIB_URLS")
+    raw = env.split(",") if env else [REDLIB_DEFAULT]
+    return [u.strip().rstrip("/") for u in raw if u.strip()]
+
+
+def _b64(s):
+    return base64.b64encode(s.encode()).decode()
+
+
+class CliError(Exception):
+    exit_code = 1
+
+
+class UsageError(CliError):
+    exit_code = 2
+
+
+class RateLimited(CliError):
+    exit_code = 3
+
+
+class NotFound(CliError):
+    exit_code = 4
+
+
+def log(msg):
+    sys.stderr.write("reddit: %s\n" % msg)
+
+
+# --------------------------------------------------------------------------
+# HTTP layer: cache + throttle + retry. All network I/O goes through here.
+# --------------------------------------------------------------------------
+
+class Http:
+    def __init__(self, cache_ttl=300.0, fresh=False, timeout=25.0,
+                 min_interval=None, retries=3, verbose=False):
+        self.cache_ttl = cache_ttl
+        self.fresh = fresh
+        self.timeout = timeout
+        self.retries = retries
+        self.verbose = verbose
+        self.min_interval = dict(MIN_INTERVAL)
+        if min_interval is not None:
+            self.min_interval = {"rss": float(min_interval),
+                                 "arctic": float(min_interval)}
+        self._last_hit = {}  # host -> ts
+        self._load_throttle_state()
+
+    # -- cross-invocation throttle state so back-to-back CLI calls don't 429
+    def _state_path(self):
+        return os.path.join(CACHE_DIR, "throttle.json")
+
+    def _load_throttle_state(self):
+        try:
+            with open(self._state_path()) as f:
+                data = json.load(f)
+            now = time.time()
+            for host, ts in data.items():
+                if now - ts < 15 * 60:
+                    self._last_hit[host] = ts
+        except (OSError, ValueError):
+            pass
+
+    def _save_throttle_state(self):
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            with open(self._state_path(), "w") as f:
+                json.dump(self._last_hit, f)
+        except OSError:
+            pass
+
+    def _cache_path(self, url):
+        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
+        return os.path.join(CACHE_DIR, digest + ".json")
+
+    def _cache_get(self, url):
+        if self.fresh:
+            return None
+        try:
+            with open(self._cache_path(url)) as f:
+                blob = json.load(f)
+            if time.time() - blob["ts"] <= self.cache_ttl:
+                return blob["body"]
+        except (OSError, ValueError, KeyError):
+            pass
+        return None
+
+    def _cache_put(self, url, body):
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            with open(self._cache_path(url), "w") as f:
+                json.dump({"ts": time.time(), "url": url, "body": body}, f)
+        except OSError:
+            pass
+
+    def _throttle(self, host, kind):
+        interval = self.min_interval.get(kind, 1.0)
+        last = self._last_hit.get(host, 0.0)
+        wait = last + interval + random.uniform(0.1, 0.5) - time.time()
+        if wait > 0:
+            wait = min(wait, MAX_THROTTLE_WAIT)
+            if self.verbose:
+                log("throttle %s: sleeping %.1fs" % (host, wait))
+            time.sleep(wait)
+
+    def get(self, url, kind):
+        """GET url; returns body text. Raises RateLimited/NotFound/CliError."""
+        host = urllib.parse.urlsplit(url).netloc
+        cached = self._cache_get(url)
+        if cached is not None:
+            if self.verbose:
+                log("cache hit %s" % url)
+            return cached
+
+        last_exc = None
+        for attempt in range(1, self.retries + 1):
+            self._throttle(host, kind)
+            req = urllib.request.Request(url, headers={
+                "User-Agent": UA,
+                "Accept": "application/atom+xml, application/xml, application/json;q=0.9, */*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            })
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    body = resp.read().decode("utf-8", "replace")
+                self._last_hit[host] = time.time()
+                self._save_throttle_state()
+                self._cache_put(url, body)
+                return body
+            except urllib.error.HTTPError as e:
+                self._last_hit[host] = time.time()
+                self._save_throttle_state()
+                if e.code == 429:
+                    retry_after = 20.0
+                    try:
+                        retry_after = float(e.headers.get("Retry-After", 20.0))
+                    except ValueError:
+                        pass
+                    last_exc = RateLimited(
+                        "rate limited by %s (HTTP 429) — cool down ~%.0fs"
+                        % (host, retry_after))
+                    if self.verbose:
+                        log("429 on attempt %d/%d: %s"
+                            % (attempt, self.retries, url))
+                    time.sleep(min(max(retry_after, 10.0), 60.0))
+                    continue
+                if e.code in (403, 401):
+                    last_exc = RateLimited(
+                        "blocked by %s (HTTP %d) — logged-out access refused; "
+                        "try later or a different engine" % (host, e.code))
+                    continue
+                if e.code == 404:
+                    raise NotFound("not found (HTTP 404): %s" % url)
+                last_exc = CliError("HTTP %d from %s" % (e.code, url))
+                if e.code >= 500:
+                    time.sleep(2.0 * attempt)
+                    continue
+                raise last_exc
+            except urllib.error.URLError as e:
+                last_exc = CliError("network error for %s: %s" % (url, e.reason))
+                time.sleep(2.0 * attempt)
+        raise last_exc if last_exc else CliError("request failed: %s" % url)
+
+
+# --------------------------------------------------------------------------
+# Atom (RSS) parsing
+# --------------------------------------------------------------------------
+
+class _TextExtractor(HTMLParser):
+    """HTML → plain text; records external links found in the content."""
+    BLOCK = {"p", "div", "li", "tr", "br", "table"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.BLOCK:
+            self.parts.append("\n")
+        if tag == "a":
+            for k, v in attrs:
+                if k == "href" and v:
+                    self.links.append(v)
+
+    def handle_endtag(self, tag):
+        if tag in self.BLOCK:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+    def text(self):
+        out = re.sub(r"[ \t]+", " ", "".join(self.parts))
+        out = re.sub(r"\n{2,}", "\n", out)
+        return out.strip()
+
+
+def html_to_text(html_str):
+    p = _TextExtractor()
+    try:
+        p.feed(html_str or "")
+        p.close()
+    except Exception:
+        return re.sub(r"<[^>]+>", " ", html_str or "").strip()
+    return p.text(), p.links
+
+
+def _atom_find(entry, tag):
+    el = entry.find(ATOM + tag)
+    return el.text if el is not None and el.text else ""
+
+
+def parse_atom(text):
+    """Parse an Atom feed into ({feed_title}, [entry dicts])."""
+    root = ET.fromstring(text.encode("utf-8"))
+    feed_title_el = root.find(ATOM + "title")
+    feed_title = (feed_title_el.text or "").strip() if feed_title_el is not None else ""
+    entries = []
+    for entry in root.findall(ATOM + "entry"):
+        link_el = entry.find(ATOM + "link")
+        content_el = entry.find(ATOM + "content")
+        author_name = ""
+        author_el = entry.find(ATOM + "author")
+        if author_el is not None:
+            name_el = author_el.find(ATOM + "name")
+            if name_el is not None and name_el.text:
+                author_name = name_el.text.strip()
+        content_html = content_el.text if content_el is not None and content_el.text else ""
+        content_text, links = html_to_text(content_html)
+        entries.append({
+            "id": _atom_find(entry, "id"),           # t3_…, t1_… or t5_…
+            "title": _atom_find(entry, "title"),
+            "link": link_el.get("href", "") if link_el is not None else "",
+            "author": author_name.replace("/u/", ""),
+            "updated": _atom_find(entry, "updated"),  # ISO 8601
+            "content_html": content_html,
+            "content_text": content_text,
+            "links": links,
+        })
+    return feed_title, entries
+
+
+def id_from_fullname(fullname):
+    return fullname[3:] if re.match(r"^t[135]_", fullname or "") else fullname
+
+
+def external_link_from(entry):
+    """First non-reddit anchor in the entry content = the linked URL, if any."""
+    for href in entry.get("links", []):
+        host = urllib.parse.urlsplit(href).netloc.lower()
+        if host and not host.endswith("reddit.com"):
+            return href
+    return None
+
+
+# --------------------------------------------------------------------------
+# Tolerant mini-DOM (stdlib html.parser) for the redlib mirror engine
+# --------------------------------------------------------------------------
+
+VOID_TAGS = {"br", "img", "input", "meta", "link", "hr", "source", "area",
+             "base", "col", "embed", "param", "track", "wbr"}
+
+
+class Node:
+    __slots__ = ("tag", "attrs", "children", "parent")
+
+    def __init__(self, tag, attrs=None, parent=None):
+        self.tag = tag
+        self.attrs = attrs or {}
+        self.children = []
+        self.parent = parent
+
+    @property
+    def classes(self):
+        return set((self.attrs.get("class") or "").split())
+
+    def text(self):
+        out = []
+
+        def walk(n):
+            for c in n.children:
+                if isinstance(c, Node):
+                    if c.tag in ("br", "p", "div", "li", "blockquote", "tr",
+                                 "h1", "h2", "h3", "details"):
+                        out.append("\n")
+                    walk(c)
+                else:
+                    out.append(c)
+        walk(self)
+        joined = "".join(out)
+        joined = re.sub(r"[ \t]+", " ", joined)
+        joined = re.sub(r"\n{2,}", "\n", joined)
+        return joined.strip()
+
+
+class DomBuilder(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.root = Node("#root")
+        self.stack = [self.root]
+
+    def handle_starttag(self, tag, attrs):
+        node = Node(tag, {k: (v or "") for k, v in attrs},
+                    parent=self.stack[-1])
+        self.stack[-1].children.append(node)
+        if tag not in VOID_TAGS:
+            self.stack.append(node)
+
+    def handle_startendtag(self, tag, attrs):
+        self.stack[-1].children.append(
+            Node(tag, {k: (v or "") for k, v in attrs}, parent=self.stack[-1]))
+
+    def handle_endtag(self, tag):
+        for i in range(len(self.stack) - 1, 0, -1):
+            if self.stack[i].tag == tag:
+                del self.stack[i:]
+                break
+
+    def handle_data(self, data):
+        if data:
+            self.stack[-1].children.append(data)
+
+
+def parse_html(text):
+    b = DomBuilder()
+    try:
+        b.feed(text)
+        b.close()
+    except Exception:
+        pass
+    return b.root
+
+
+def find_all(node, tag=None, cls=None, exclude_cls=None, out=None):
+    """DFS collect matching nodes; never descends into nodes whose class
+    set intersects exclude_cls (how we skip nested comment replies)."""
+    if out is None:
+        out = []
+    for c in node.children:
+        if not isinstance(c, Node):
+            continue
+        blocked = bool(exclude_cls and exclude_cls & c.classes)
+        if not blocked and ((tag is None or c.tag == tag) and
+                            (cls is None or cls in c.classes)):
+            out.append(c)
+        if not blocked:
+            find_all(c, tag, cls, exclude_cls, out)
+    return out
+
+
+def find_first(node, tag=None, cls=None, exclude_cls=None):
+    found = find_all(node, tag, cls, exclude_cls)
+    return found[0] if found else None
+
+
+def _int_or_none(s):
+    m = re.search(r"-?\d+", s or "")
+    return int(m.group(0)) if m else None
+
+
+def _parse_redlib_time(s):
+    """'Sep 04 2026, 16:05:19 UTC' → epoch."""
+    import calendar
+    try:
+        st = time.strptime(s.strip(), "%b %d %Y, %H:%M:%S UTC")
+        return calendar.timegm(st)
+    except (ValueError, TypeError):
+        return None
+
+
+def redlib_guard(html, base):
+    m = re.search(r"<title>([^<]*)</title>", html[:4000], re.I)
+    title = (m.group(1) if m else "").lower()
+    if any(marker in title for marker in REDLIB_BLOCK_MARKERS):
+        raise RateLimited("redlib instance %s served a bot-wall page (%s)"
+                          % (base, title[:60]))
+    if len(html) < 500:
+        raise RateLimited("redlib instance %s returned an empty page" % base)
+
+
+def redlib_post_from_div(div):
+    """One `div.post` (listing/search/user page) → normalized post record."""
+    pid = div.attrs.get("id", "")
+    if not ID36_RE.match(pid):
+        return None
+    h2 = find_first(div, "h2", "post_title")
+    title, href, flair = "", "", None
+    if h2 is not None:
+        for a in find_all(h2, "a"):
+            if "post_flair" in a.classes:
+                flair = a.text() or None
+                continue
+            title = a.text()
+            href = a.attrs.get("href", "")
+            break
+        if not title:
+            title = h2.text()
+    permalink = "https://www.reddit.com" + href if href.startswith("/r/") else href
+    score_el = find_first(div, "div", "post_score")
+    score = _int_or_none(score_el.attrs.get("title")) if score_el else None
+    com_el = find_first(div, "a", "post_comments")
+    num_comments = _int_or_none(com_el.attrs.get("title")) if com_el else None
+    author_el = find_first(div, "a", "post_author")
+    author = None
+    if author_el:
+        author = author_el.attrs.get("href", "").rstrip("/").split("/")[-1]
+    sub_el = find_first(div, "a", "post_subreddit")
+    subreddit = re.sub(r"^r/", "", sub_el.text().strip()) if sub_el else None
+    created_el = find_first(div, "span", "created")
+    created = (_parse_redlib_time(created_el.attrs.get("title"))
+               if created_el else None)
+    body_el = find_first(div, "div", "post_body")
+    selftext = body_el.text() if body_el else None
+    stickied = "stickied" in div.classes
+    return {
+        "id": pid,
+        "fullname": "t3_" + pid,
+        "title": title,
+        "subreddit": subreddit,
+        "author": author,
+        "created_utc": created,
+        "permalink": permalink,
+        "url": None,
+        "selftext": selftext or None,
+        "flair": flair,
+        "score": score,
+        "upvote_ratio": None,
+        "num_comments": num_comments,
+        "stickied": stickied,
+        "score_source": "redlib-mirror(live)" if score is not None else None,
+    }
+
+
+def redlib_parse_listing(html):
+    return [p for p in (redlib_post_from_div(d)
+                        for d in find_all(parse_html(html), "div", "post"))
+            if p]
+
+
+def _text_without_flair(node):
+    """Text of a title node, skipping the a.post_flair anchor inside it."""
+    out = []
+
+    def walk(n):
+        for c in n.children:
+            if isinstance(c, Node):
+                if "post_flair" in c.classes:
+                    continue
+                walk(c)
+            else:
+                out.append(c)
+    walk(node)
+    return re.sub(r"\s+", " ", "".join(out)).strip()
+
+
+def redlib_parse_thread(html):
+    """Post + comments page → (post_record, [comment records]).
+
+    Nesting: replies of a comment live in a blockquote.replies INSIDE the
+    parent div.comment; comment ids look like 'p7tzztd' (p + base36 id).
+    """
+    root = parse_html(html)
+    op_div = find_first(root, "div", "highlighted")
+    post = None
+    if op_div is not None:
+        h1 = find_first(op_div, "h1", "post_title")
+        flair_el = find_first(op_div, "a", "post_flair")
+        score_el = find_first(op_div, "div", "post_score")
+        com_el = find_first(op_div, "a", "post_comments")
+        count_el = next((c for c in find_all(root, "p")
+                         if c.attrs.get("id") == "comment_count"), None)
+        num_comments = None
+        if com_el is not None:
+            num_comments = _int_or_none(com_el.attrs.get("title"))
+        elif count_el is not None:
+            num_comments = _int_or_none(count_el.text())
+        author_el = find_first(op_div, "a", "post_author")
+        sub_el = find_first(op_div, "a", "post_subreddit")
+        created_el = find_first(op_div, "span", "created")
+        body_el = find_first(op_div, "div", "post_body")
+        pid = op_div.attrs.get("id", "")
+        pid = pid if ID36_RE.match(pid) else None
+        post = {
+            "id": pid,
+            "fullname": "t3_" + pid if pid else None,
+            "title": _text_without_flair(h1) if h1 is not None else None,
+            "subreddit": (re.sub(r"^r/", "", sub_el.text().strip())
+                          if sub_el else None),
+            "author": (author_el.attrs.get("href", "").rstrip("/")
+                       .split("/")[-1] if author_el else None),
+            "created_utc": (_parse_redlib_time(created_el.attrs.get("title"))
+                            if created_el else None),
+            "permalink": None,
+            "url": None,
+            "selftext": body_el.text() if body_el else None,
+            "flair": flair_el.text() if flair_el else None,
+            "score": (_int_or_none(score_el.attrs.get("title"))
+                      if score_el else None),
+            "upvote_ratio": None,
+            "num_comments": num_comments,
+            "score_source": "redlib-mirror(live)",
+        }
+    comments = []
+    for c in find_all(root, "div", "comment"):
+        raw_id = c.attrs.get("id", "")
+        cid = raw_id[1:] if raw_id.startswith("p") and len(raw_id) > 4 else raw_id
+        if not ID36_RE.match(cid):
+            continue
+        score_el = find_first(c, "p", "comment_score", exclude_cls={"replies"})
+        author_el = find_first(c, "a", "comment_author",
+                               exclude_cls={"replies"})
+        body_el = find_first(c, "div", "comment_body",
+                             exclude_cls={"replies"})
+        link_el = find_first(c, "a", "comment_link", exclude_cls={"replies"})
+        created_el = find_first(c, "span", "created", exclude_cls={"replies"})
+        sub_el = find_first(c, "a", "post_subreddit", exclude_cls={"replies"})
+        # depth/parent by walking ancestors (each replies-wrapper = +1)
+        depth, parent = 0, None
+        anc = c.parent
+        while anc is not None and anc.tag != "#root":
+            if "replies" in anc.classes:
+                depth += 1
+            if parent is None and anc.tag == "div" and "comment" in anc.classes:
+                pid_ = anc.attrs.get("id", "")
+                parent = pid_[1:] if pid_.startswith("p") else pid_
+            anc = anc.parent
+        permalink = None
+        if link_el is not None:
+            href = link_el.attrs.get("href", "")
+            if href.startswith("/r/"):
+                permalink = "https://www.reddit.com" + href
+        comments.append({
+            "id": cid,
+            "fullname": "t1_" + cid,
+            "parent": parent,
+            "is_top_level": parent is None,
+            "author": (author_el.attrs.get("href", "").rstrip("/")
+                       .split("/")[-1] if author_el else None),
+            "created_utc": (_parse_redlib_time(created_el.attrs.get("title"))
+                            if created_el else None),
+            "score": (_int_or_none(score_el.attrs.get("title"))
+                      if score_el else None),
+            "body": body_el.text() if body_el else None,
+            "subreddit": (re.sub(r"^r/", "", sub_el.text().strip())
+                          if sub_el else None),
+            "permalink": permalink,
+            "score_source": "redlib-mirror(live)",
+        })
+    return post, comments
+
+
+def redlib_parse_user_comments(html, author_name=None):
+    """`div.comment.user-comment` blocks on /user/<n>/comments. The div has
+    no id — the comment id lives in the comment_link href. The body is a
+    p.comment_body here (div.comment_body on thread pages) and there is no
+    author element (the page owner IS the author)."""
+    out = []
+    for c in find_all(parse_html(html), "div", "comment"):
+        link_el = find_first(c, "a", "comment_link")
+        href = link_el.attrs.get("href", "") if link_el is not None else ""
+        m = re.search(r"/r/([A-Za-z0-9_]+)/comments/([a-z0-9]+)/[^/]*/"
+                      r"([a-z0-9]+)", href)
+        if not m:
+            continue
+        subreddit, link_id, raw_cid = m.groups()
+        cid = raw_cid[1:] if raw_cid.startswith("p") and len(raw_cid) > 4 \
+            else raw_cid
+        if not ID36_RE.match(cid):
+            continue
+        score_el = find_first(c, None, "comment_score")
+        body_el = find_first(c, None, "comment_body")
+        created_el = find_first(c, "span", "created")
+        out.append({
+            "id": cid, "fullname": "t1_" + cid, "parent": None,
+            "is_top_level": None,
+            "author": author_name,
+            "created_utc": (_parse_redlib_time(created_el.attrs.get("title"))
+                            if created_el else None),
+            "score": (_int_or_none(score_el.attrs.get("title"))
+                      if score_el else None),
+            "body": body_el.text() if body_el else None,
+            "subreddit": subreddit,
+            "link_id": link_id,
+            "permalink": "https://www.reddit.com" + href,
+            "score_source": "redlib-mirror(live)",
+        })
+    return out
+
+
+# --------------------------------------------------------------------------
+# Record normalization
+# --------------------------------------------------------------------------
+
+def fmt_time(epoch):
+    try:
+        return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(float(epoch)))
+    except (TypeError, ValueError):
+        return ""
+
+
+def iso_to_epoch(iso):
+    try:
+        t = re.sub(r"Z$", "+00:00", iso)
+        import datetime
+        return datetime.datetime.fromisoformat(t).timestamp()
+    except Exception:
+        return None
+
+
+def post_from_rss(entry):
+    """Build a normalized post record from an Atom listing/search entry."""
+    pid = id_from_fullname(entry["id"])
+    epoch = iso_to_epoch(entry["updated"])
+    rec = {
+        "id": pid,
+        "fullname": "t3_" + pid,
+        "title": entry["title"],
+        "author": entry["author"],
+        "created_utc": epoch,
+        "permalink": entry["link"],
+        "url": external_link_from(entry),
+        "selftext": entry["content_text"] or None,
+        "score": None,
+        "upvote_ratio": None,
+        "num_comments": None,
+        "score_source": None,
+    }
+    return rec
+
+
+def post_from_arctic(d, source="arctic-archive"):
+    pid = id_from_fullname(str(d.get("id", "")))
+    rec = {
+        "id": pid,
+        "fullname": "t3_" + pid,
+        "title": d.get("title"),
+        "subreddit": d.get("subreddit"),
+        "author": d.get("author"),
+        "created_utc": d.get("created_utc"),
+        "permalink": "https://www.reddit.com" + d.get("permalink", "") if d.get("permalink") else None,
+        "url": d.get("url") if not (d.get("url") or "").startswith(
+            "https://www.reddit.com/r/") else None,
+        "selftext": d.get("selftext") or None,
+        "flair": d.get("link_flair_text"),
+        "score": d.get("score"),
+        "upvote_ratio": d.get("upvote_ratio"),
+        "num_comments": d.get("num_comments"),
+        "over_18": d.get("over_18"),
+        "edited": bool(d.get("edited")),
+        "score_source": source,
+    }
+    return rec
+
+
+def enrich_posts(http, posts, enabled=True):
+    """Fill in score/upvote_ratio/num_comments from Arctic Shift by id batch."""
+    if not enabled:
+        return posts
+    missing = [p for p in posts if p.get("score") is None]
+    if not missing:
+        return posts
+    for i in range(0, len(missing), ARCTIC_IDS_BATCH):
+        chunk = missing[i:i + ARCTIC_IDS_BATCH]
+        ids = ",".join("t3_" + p["id"] for p in chunk)
+        url = "%s/posts/ids?ids=%s" % (ARCTIC_BASE, urllib.parse.quote(ids))
+        try:
+            body = http.get(url, "arctic")
+            data = json.loads(body).get("data") or []
+        except CliError as e:
+            if http.verbose:
+                log("score enrichment skipped: %s" % e)
+            for p in chunk:
+                p["score_source"] = None
+            continue
+        by_id = {id_from_fullname(str(d.get("id", ""))): d for d in data}
+        for p in chunk:
+            d = by_id.get(p["id"])
+            if d:
+                p["score"] = d.get("score")
+                p["upvote_ratio"] = d.get("upvote_ratio")
+                p["num_comments"] = d.get("num_comments")
+                if d.get("selftext") and not p.get("selftext"):
+                    p["selftext"] = d.get("selftext")
+                if d.get("subreddit") and not p.get("subreddit"):
+                    p["subreddit"] = d.get("subreddit")
+                p["score_source"] = "arctic-archive"
+            else:
+                p["score_source"] = None
+    return posts
+
+
+# --------------------------------------------------------------------------
+# Engines
+# --------------------------------------------------------------------------
+
+class Reddit:
+    def __init__(self, http):
+        self.http = http
+
+    # -- RSS ---------------------------------------------------------------
+
+    def rss(self, path, params=None):
+        query = ""
+        if params:
+            clean = {k: v for k, v in params.items() if v is not None}
+            query = "?" + urllib.parse.urlencode(clean)
+        url = RSS_BASE + path + query
+        body = self.http.get(url, "rss")
+        try:
+            return parse_atom(body)
+        except ET.ParseError as e:
+            if "blocked" in body[:2000].lower() or "Welcome to Reddit" in body[:4000]:
+                raise RateLimited("reddit served a block page instead of RSS — "
+                                  "cool down and retry")
+            raise CliError("cannot parse feed from %s: %s" % (url, e))
+
+    def arctic(self, path, params=None):
+        query = ""
+        if params:
+            query = "?" + urllib.parse.urlencode(
+                {k: v for k, v in params.items() if v is not None})
+        url = ARCTIC_BASE + path + query
+        body = self.http.get(url, "arctic")
+        try:
+            data = json.loads(body)
+        except ValueError:
+            raise CliError("bad JSON from arctic-shift: %s" % url)
+        if isinstance(data, dict) and data.get("error"):
+            raise CliError("arctic-shift: %s" % data["error"])
+        return data.get("data") if isinstance(data, dict) else data
+
+    def pullpush(self, kind, params):
+        """Second archive (near-real-time ingest). NOTE: only ids=/link_id=
+        endpoints work anonymously — search params are hard-blocked (429)."""
+        url = "%s/%s/?%s" % (PULLPUSH_BASE, kind,
+                             urllib.parse.urlencode(
+                                 {k: v for k, v in params.items()
+                                  if v is not None}))
+        body = self.http.get(url, "pullpush")
+        try:
+            data = json.loads(body)
+        except ValueError:
+            raise CliError("bad JSON from pullpush: %s" % url)
+        if isinstance(data, dict) and data.get("error"):
+            raise CliError("pullpush: %s" % data["error"])
+        return data.get("data") or []
+
+    def redlib(self, path, params=None):
+        """Fetch a page from the first healthy mirror instance (GET only,
+        mirrors break on HEAD). Returns parsed HTML text."""
+        query = ""
+        if params:
+            query = "?" + urllib.parse.urlencode(
+                {k: v for k, v in params.items() if v is not None})
+        last_err = None
+        for base in redlib_instances():
+            url = base + path + query
+            try:
+                html = self.http.get(url, "redlib")
+                redlib_guard(html, base)
+                return html
+            except CliError as e:
+                last_err = e
+                log("redlib %s failed: %s" % (base, e))
+                continue
+        raise last_err if last_err else CliError("no redlib instance configured")
+
+    # -- optional OAuth engine (app-only, anonymous; see KNOWHOW.md §5) ------
+
+    def _oauth_token_path(self):
+        return os.path.join(CACHE_DIR, "oauth-token.json")
+
+    def _oauth_device_id(self):
+        """Stable per-machine device id (reddit validates the format —
+        plain words like 'my-device' are rejected as bad device_id)."""
+        path = os.path.join(CACHE_DIR, "oauth-device-id")
+        try:
+            did = open(path).read().strip()
+            if did:
+                return did
+        except OSError:
+            pass
+        import uuid
+        did = str(uuid.uuid4())
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            with open(path, "w") as f:
+                f.write(did)
+        except OSError:
+            pass
+        return did
+
+    def oauth_token(self):
+        cid = os.environ.get("ANY2CLI_REDDIT_CLIENT_ID", "")
+        sec = os.environ.get("ANY2CLI_REDDIT_CLIENT_SECRET", "")
+        if not cid:
+            raise CliError("oauth engine needs ANY2CLI_REDDIT_CLIENT_ID "
+                           "(app-only token, still account-free — see "
+                           "examples/reddit/KNOWHOW.md)")
+        try:
+            blob = json.load(open(self._oauth_token_path()))
+            if time.time() < blob.get("expires_at", 0) - 60:
+                return blob["access_token"], cid, sec
+        except (OSError, ValueError, KeyError):
+            pass
+        if sec:
+            grant = {"grant_type": "client_credentials"}
+        else:
+            grant = {"grant_type":
+                     "https://oauth.reddit.com/grants/installed_client",
+                     "device_id": self._oauth_device_id()}
+        data = urllib.parse.urlencode(grant).encode()
+        req = urllib.request.Request(
+            "https://www.reddit.com/api/v1/access_token", data=data,
+            headers={"User-Agent": UA,
+                     "Authorization": "Basic " + _b64("%s:%s" % (cid, sec))})
+        try:
+            with urllib.request.urlopen(req, timeout=self.http.timeout) as r:
+                tok = json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            raise CliError("oauth token request failed (HTTP %d) — bad "
+                           "client id/secret?" % e.code)
+        if "access_token" not in tok:
+            raise CliError("oauth grant refused: %s"
+                           % tok.get("error", "unknown"))
+        tok["expires_at"] = time.time() + tok.get("expires_in", 3600)
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            json.dump(tok, open(self._oauth_token_path(), "w"))
+        except OSError:
+            pass
+        return tok["access_token"], cid, sec
+
+    def oauth(self, path, params=None):
+        """GET an oauth.reddit.com JSON endpoint. Returns parsed JSON."""
+        token, _, _ = self.oauth_token()
+        query = ""
+        if params:
+            query = "?" + urllib.parse.urlencode(
+                {k: v for k, v in params.items() if v is not None})
+        req = urllib.request.Request(
+            OAUTH_BASE + path + query,
+            headers={"User-Agent": UA, "Authorization": "bearer " + token})
+        self.http._throttle("oauth.reddit.com", "oauth")
+        try:
+            with urllib.request.urlopen(req, timeout=self.http.timeout) as r:
+                self.http._last_hit["oauth.reddit.com"] = time.time()
+                return json.loads(r.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                try:
+                    os.remove(self._oauth_token_path())
+                except OSError:
+                    pass
+            raise CliError("oauth.reddit.com HTTP %d on %s" % (e.code, path))
+
+    # -- commands ------------------------------------------------------------
+
+    def posts(self, sub, sort="hot", t=None, limit=25, enrich=True,
+              engine="auto", after=None):
+        sub = strip_sub_prefix(sub)
+        if sort not in REDDIT_SORTS:
+            raise UsageError("sort must be one of %s" % ", ".join(REDDIT_SORTS))
+        if engine == "oauth" or (engine == "auto"
+                                 and os.environ.get("ANY2CLI_REDDIT_CLIENT_ID")):
+            try:
+                data = self.oauth("/r/%s/%s" % (sub, sort),
+                                  {"limit": min(limit, 100), "t": t,
+                                   "after": after})
+                posts = [post_from_arctic(c["data"], "oauth(live)")
+                         for c in data.get("data", {}).get("children", [])]
+                return posts[:limit], "oauth(live)"
+            except CliError as e:
+                if engine == "oauth":
+                    raise
+                log("oauth listing failed (%s); falling back" % e)
+        if engine in ("auto", "redlib"):
+            try:
+                # path-form sort only: the mirror drops ?sort=/t= query forms
+                html = self.redlib("/r/%s/%s" % (sub, sort), {"t": t})
+                posts = redlib_parse_listing(html)[:limit]
+                if posts or engine == "redlib":
+                    return posts, "redlib-mirror(live)"
+            except CliError as e:
+                if engine == "redlib":
+                    raise
+                log("redlib listing failed (%s); falling back to rss" % e)
+        if engine == "arctic":
+            data = self.arctic("/posts/search",
+                               {"subreddit": sub, "limit": limit, "sort": "desc"})
+            return [post_from_arctic(d) for d in (data or [])], "arctic(new)"
+        try:
+            _, entries = self.rss("/r/%s/%s.rss" % (sub, sort),
+                                  {"limit": limit, "t": t, "after": after})
+        except RateLimited:
+            # logged-out RSS throttled us: fall back to the archive, newest first
+            log("rss rate-limited; falling back to arctic-shift (new, archive)")
+            data = self.arctic("/posts/search",
+                               {"subreddit": sub, "limit": limit, "sort": "desc"})
+            return [post_from_arctic(d) for d in (data or [])], "arctic(new)"
+        posts = [post_from_rss(e) for e in entries[:limit]]
+        for p in posts:
+            p["subreddit"] = sub
+        posts = enrich_posts(self.http, posts, enrich)
+        return posts, "rss" + ("+arctic-scores" if enrich else "")
+
+    def search(self, query, sub=None, sort="relevance", t=None, limit=25,
+               enrich=True, engine="auto", after=None):
+        if sort not in SEARCH_SORTS:
+            raise UsageError("search sort must be one of %s" % ", ".join(SEARCH_SORTS))
+        if engine == "oauth" or (engine == "auto"
+                                 and os.environ.get("ANY2CLI_REDDIT_CLIENT_ID")):
+            try:
+                if sub:
+                    path = "/r/%s/search" % strip_sub_prefix(sub)
+                    params = {"q": query, "restrict_sr": "true",
+                              "sort": sort, "t": t, "limit": min(limit, 100),
+                              "after": after}
+                else:
+                    path = "/search"
+                    params = {"q": query, "sort": sort, "t": t,
+                              "limit": min(limit, 100), "after": after}
+                data = self.oauth(path, params)
+                posts = [post_from_arctic(c["data"], "oauth(live)")
+                         for c in data.get("data", {}).get("children", [])]
+                return posts[:limit], "oauth(live)"
+            except CliError as e:
+                if engine == "oauth":
+                    raise
+                log("oauth search failed (%s); falling back" % e)
+        if engine in ("auto", "redlib"):
+            try:
+                if sub:
+                    path = "/r/%s/search" % strip_sub_prefix(sub)
+                    params = {"q": query, "restrict_sr": "on",
+                              "sort": sort, "t": t}
+                else:
+                    path = "/search"
+                    params = {"q": query, "sort": sort, "t": t}
+                html = self.redlib(path, params)
+                posts = redlib_parse_listing(html)[:limit]
+                if posts or engine == "redlib":
+                    return posts, "redlib-mirror(live)"
+            except CliError as e:
+                if engine == "redlib":
+                    raise
+                log("redlib search failed (%s); falling back to rss" % e)
+        if sub:
+            path = "/r/%s/search.rss" % strip_sub_prefix(sub)
+            params = {"q": query, "restrict_sr": "on", "sort": sort,
+                      "t": t, "limit": limit}
+        else:
+            path = "/search.rss"
+            params = {"q": query, "sort": sort, "t": t, "limit": limit}
+        try:
+            _, entries = self.rss(path, params)
+        except RateLimited:
+            # archive fallback: title keyword match, newest first (slower)
+            log("rss search rate-limited; falling back to arctic-shift "
+                "(title match, newest first)")
+            data = self.arctic("/posts/search", {
+                "title": query,
+                "subreddit": strip_sub_prefix(sub) if sub else None,
+                "limit": limit, "sort": "desc"})
+            posts = [post_from_arctic(d) for d in (data or [])]
+            return posts, "arctic(title-search)"
+        posts = [post_from_rss(e) for e in entries if e["id"].startswith("t3_")]
+        posts = posts[:limit]
+        posts = enrich_posts(self.http, posts, enrich)
+        return posts, "rss" + ("+arctic-scores" if enrich else "")
+
+    def subs(self, query, limit=25):
+        """Find subreddits. Primary: /subreddits/search.rss (often 429 when
+        logged out). Fallback: /search.rss?q=&type=sr (community cards)."""
+        if os.environ.get("ANY2CLI_REDDIT_CLIENT_ID"):
+            try:
+                data = self.oauth("/subreddits/search",
+                                  {"q": query, "limit": min(limit, 100)})
+                out = []
+                for c in data.get("data", {}).get("children", []):
+                    d = c["data"]
+                    out.append({
+                        "name": d.get("display_name"),
+                        "title": d.get("title"),
+                        "url": "https://www.reddit.com/r/%s/" % d.get("display_name"),
+                        "description": (d.get("public_description") or None),
+                        "subscribers": d.get("subscribers"),
+                        "created": fmt_time(d.get("created_utc")),
+                    })
+                if out:
+                    return out[:limit], "oauth(live)"
+            except CliError as e:
+                log("oauth subreddit search failed (%s); falling back" % e)
+        try:
+            _, entries = self.rss("/subreddits/search.rss",
+                                  {"q": query, "limit": limit})
+            used = "/subreddits/search.rss"
+        except (RateLimited, CliError) as e:
+            if isinstance(e, RateLimited):
+                log("subreddits search rate-limited; falling back to search.rss")
+            _, entries = self.rss("/search.rss",
+                                  {"q": query, "limit": 50, "type": "sr"})
+            entries = [e2 for e2 in entries if e2["id"].startswith("t5_")]
+            used = "search.rss?type=sr"
+        out = []
+        for e in entries[:limit]:
+            name = ""
+            m = re.search(r"/r/([A-Za-z0-9_]+)/?", e["link"])
+            if m:
+                name = m.group(1)
+            desc, _ = html_to_text(e.get("content_html", ""))
+            out.append({
+                "name": name,
+                "title": e["title"],
+                "url": e["link"],
+                "description": desc[:300] or None,
+                "created": e["updated"],
+            })
+        return out, used
+
+    def post(self, ident, engine="auto"):
+        pid = parse_post_id(ident)
+        # 0) oauth (if configured): one call, live score + ratio + counts
+        if engine == "oauth" or (engine == "auto"
+                                 and os.environ.get("ANY2CLI_REDDIT_CLIENT_ID")):
+            try:
+                data = self.oauth("/api/info", {"id": "t3_" + pid})
+                children = (data.get("data", {}).get("children", [])
+                            if isinstance(data, dict) else [])
+                if children:
+                    return post_from_arctic(children[0]["data"], "oauth(live)")
+            except CliError as e:
+                if engine == "oauth":
+                    raise
+                log("oauth info failed (%s); falling back" % e)
+        # 1) mirror: live score + title in one page
+        if engine in ("auto", "redlib"):
+            try:
+                html = self.redlib("/comments/%s" % pid)
+                rec, _ = redlib_parse_thread(html)
+                if rec and rec.get("title"):
+                    if not rec.get("id"):
+                        rec["id"] = pid
+                        rec["fullname"] = "t3_" + pid
+                    if not rec.get("permalink"):
+                        base = "/r/%s/comments/%s/" % (rec.get("subreddit") or "_", pid)
+                        rec["permalink"] = "https://www.reddit.com" + base
+                    return rec
+            except CliError as e:
+                if engine == "redlib":
+                    raise
+                log("redlib post failed (%s); trying arctic-shift" % e)
+        # 2) archive lookup (scores at ingest time)
+        if engine in ("auto", "arctic"):
+            data = self.arctic("/posts/ids", {"ids": "t3_" + pid})
+            if data:
+                return post_from_arctic(data[0])
+        # 3) second archive (near-real-time ingest — good for fresh posts)
+        if engine in ("auto", "arctic"):
+            try:
+                data = self.pullpush("submission", {"ids": pid})
+                if data:
+                    return post_from_arctic(data[0])
+            except CliError as e:
+                log("pullpush lookup failed: %s" % e)
+        # 4) the thread's own feed: entry 0 is the post (no scores)
+        if engine in ("auto", "rss"):
+            log("archives missed; trying rss feed")
+            try:
+                _, entries = self.rss("/comments/%s.rss" % pid, {"limit": 5})
+            except CliError:
+                entries = []
+            if entries:
+                rec = post_from_rss(entries[0])
+                rec["subreddit"] = subreddit_from_link(entries[0]["link"])
+                rec["score_source"] = None
+                return rec
+        # 5) URL inputs only: oembed gives title/author, no score
+        if ident.strip().lower().startswith("http"):
+            try:
+                return self.oembed_post(ident.strip())
+            except CliError as e:
+                log("oembed fallback failed: %s" % e)
+        raise NotFound("post t3_%s not found (mirror + archives + feed all "
+                       "missed); it may be brand new, deleted, or from a "
+                       "private subreddit" % pid)
+
+    def oembed_post(self, permalink):
+        url = "%s/oembed?url=%s" % (RSS_BASE, urllib.parse.quote(permalink, safe=""))
+        body = self.http.get(url, "rss")
+        try:
+            d = json.loads(body)
+        except ValueError:
+            raise CliError("oembed returned non-JSON")
+        if "html" not in d and "title" not in d:
+            raise CliError("oembed returned no post data")
+        title = d.get("title")
+        m = re.search(r'reddit-embed-bq[^>]*>\s*<a href="([^"]+)">([^<]+)</a>',
+                      d.get("html", ""))
+        link = m.group(1) if m else permalink
+        title = title or (m.group(2) if m else None)
+        return {
+            "id": None, "fullname": None, "title": title,
+            "author": (d.get("author_name") or "").replace("/u/", ""),
+            "created_utc": None, "permalink": link,
+            "url": None, "selftext": None,
+            "score": None, "upvote_ratio": None, "num_comments": None,
+            "score_source": None,
+            "note": "oembed fallback: title/author only, no score",
+        }
+
+    def comments(self, ident, limit=100, sort=None, engine="auto"):
+        """Comments for one post.
+
+        redlib: full tree with LIVE scores and server-side sorting.
+        arctic: flat set with parent_id (tree-able), archived scores.
+        pullpush: second archive, near-real-time ingest.
+        rss: live thread, works before archives catch up (no scores).
+        """
+        pid = parse_post_id(ident)
+        if sort is not None and sort not in COMMENT_SORTS:
+            raise UsageError("comment sort must be one of %s"
+                             % ", ".join(COMMENT_SORTS))
+        if engine == "oauth" or (engine == "auto"
+                                 and os.environ.get("ANY2CLI_REDDIT_CLIENT_ID")):
+            try:
+                api_sort = {"best": "confidence", "top": "top",
+                            "new": "new", "controversial": "controversial",
+                            "old": "old"}.get(sort)
+                data = self.oauth("/comments/%s" % pid,
+                                  {"sort": api_sort, "limit": limit,
+                                   "depth": 10})
+                if isinstance(data, list) and len(data) > 1:
+                    comments = []
+                    _oauth_flatten(data[1].get("data", {}).get("children", []),
+                                   comments, limit)
+                    if comments or engine == "oauth":
+                        return comments, "oauth(live)"
+            except CliError as e:
+                if engine == "oauth":
+                    raise
+                log("oauth comments failed (%s); falling back" % e)
+        if engine in ("auto", "redlib"):
+            try:
+                params = {"sort": {"best": "confidence"}.get(sort, sort)}
+                html = self.redlib("/comments/%s" % pid, params)
+                _, comments = redlib_parse_thread(html)
+                if comments or engine == "redlib":
+                    return comments[:limit], "redlib-mirror(live)"
+            except CliError as e:
+                if engine == "redlib":
+                    raise
+                log("redlib comments failed (%s); trying arctic-shift" % e)
+        comments = []
+        if engine in ("auto", "arctic"):
+            try:
+                data = self.arctic("/comments/search",
+                                   {"link_id": "t3_" + pid, "limit": limit})
+                comments = [comment_from_arctic(d) for d in (data or [])]
+            except CliError as e:
+                log("arctic comments failed (%s)" % e)
+            if comments:
+                return comments, "arctic-archive"
+            try:
+                data = self.pullpush("comment", {"link_id": pid, "size": limit})
+                comments = [comment_from_arctic(d) for d in (data or [])]
+            except CliError as e:
+                log("pullpush comments failed (%s)" % e)
+            if comments:
+                return comments, "pullpush-archive"
+        if engine in ("auto", "rss"):
+            try:
+                _, entries = self.rss("/comments/%s.rss" % pid, {"limit": limit})
+                comments = [comment_from_rss(e) for e in entries
+                            if e["id"].startswith("t1_")]
+                if comments:
+                    return comments[:limit], "rss(live)"
+            except CliError as e:
+                if not comments:
+                    raise
+        return comments, None
+
+    def user(self, name, kind="posts", limit=25, enrich=True, engine="auto"):
+        name = name.strip().lstrip("/").replace("/u/", "")
+        if kind not in ("posts", "comments", "overview"):
+            raise UsageError("kind must be posts, comments or overview")
+        if engine == "oauth" or (engine == "auto"
+                                 and os.environ.get("ANY2CLI_REDDIT_CLIENT_ID")):
+            try:
+                tab = "submitted" if kind == "posts" else kind
+                data = self.oauth("/user/%s/%s" % (name, tab),
+                                  {"limit": min(limit, 100)})
+                children = (data.get("data", {}).get("children", [])
+                            if isinstance(data, dict) else [])
+                if kind == "comments":
+                    items = [comment_from_arctic(c["data"])
+                             for c in children]
+                    for i in items:
+                        i["score_source"] = "oauth(live)"
+                    return items[:limit], "oauth(live)"
+                items = [post_from_arctic(c["data"], "oauth(live)")
+                         for c in children]
+                return items[:limit], "oauth(live)"
+            except CliError as e:
+                if engine == "oauth":
+                    raise
+                log("oauth user failed (%s); falling back" % e)
+        if engine in ("auto", "redlib") and kind in ("posts", "comments"):
+            try:
+                if kind == "posts":
+                    html = self.redlib("/user/%s/submitted" % name)
+                    items = redlib_parse_listing(html)[:limit]
+                    return items, "redlib-mirror(live)"
+                html = self.redlib("/user/%s/comments" % name)
+                items = redlib_parse_user_comments(html, author_name=name)[:limit]
+                return items, "redlib-mirror(live)"
+            except CliError as e:
+                if engine == "redlib":
+                    raise
+                log("redlib user page failed (%s); falling back to rss" % e)
+        kind_path = {"posts": "submitted", "comments": "comments",
+                     "overview": "overview"}[kind]
+        try:
+            _, entries = self.rss("/user/%s/%s.rss" % (name, kind_path),
+                                  {"limit": limit})
+        except RateLimited:
+            log("user feed rate-limited; falling back to arctic-shift")
+            if kind == "comments":
+                data = self.arctic("/comments/search",
+                                   {"author": name, "limit": limit, "sort": "desc"})
+                return [comment_from_arctic(d) for d in (data or [])], "arctic"
+            data = self.arctic("/posts/search",
+                               {"author": name, "limit": limit, "sort": "desc"})
+            return [post_from_arctic(d) for d in (data or [])], "arctic"
+        out = []
+        for e in entries[:limit]:
+            if e["id"].startswith("t3_"):
+                rec = post_from_rss(e)
+                rec["subreddit"] = subreddit_from_link(e["link"])
+                out.append(rec)
+            else:
+                rec = comment_from_rss(e)
+                rec["subreddit"] = subreddit_from_link(e["link"])
+                out.append(rec)
+        t3s = [r for r in out if r["fullname"].startswith("t3_")]
+        enrich_posts(self.http, t3s, enrich)
+        return out, "rss" + ("+arctic-scores" if enrich else "")
+
+
+def _oauth_flatten(children, out, limit):
+    """Flatten an oauth comment tree (kind t1, nested `replies`) in
+    depth-first order, keeping parent ids and scores."""
+    for ch in children:
+        if len(out) >= limit:
+            return
+        if ch.get("kind") != "t1":
+            if ch.get("kind") == "more":  # "load more comments" stub
+                continue
+        d = ch.get("data", {})
+        rec = comment_from_arctic(d)
+        rec["score_source"] = "oauth(live)"
+        out.append(rec)
+        replies = d.get("replies")
+        if isinstance(replies, dict):
+            _oauth_flatten(replies.get("data", {}).get("children", []),
+                           out, limit)
+
+
+def comment_from_arctic(d):
+    cid = id_from_fullname(str(d.get("id", "")))
+    parent = d.get("parent_id")
+    depth = d.get("depth")
+    return {
+        "id": cid,
+        "fullname": "t1_" + cid,
+        "parent": id_from_fullname(parent) if parent else None,
+        "is_top_level": (not parent or str(parent).startswith("t3_")),
+        "author": d.get("author"),
+        "created_utc": d.get("created_utc"),
+        "score": d.get("score"),
+        "body": d.get("body"),
+        "subreddit": d.get("subreddit"),
+        "link_id": id_from_fullname(str(d.get("link_id", ""))),
+        "score_source": "arctic-archive",
+    }
+
+
+def comment_from_rss(e):
+    cid = id_from_fullname(e["id"])
+    body, _ = html_to_text(e.get("content_html", ""))
+    epoch = iso_to_epoch(e["updated"])
+    return {
+        "id": cid,
+        "fullname": "t1_" + cid,
+        "parent": None,
+        "is_top_level": None,
+        "author": e["author"],
+        "created_utc": epoch,
+        "score": None,
+        "body": body or None,
+        "subreddit": subreddit_from_link(e["link"]),
+        "link_id": None,
+        "score_source": None,
+        "permalink": e["link"],
+    }
+
+
+def subreddit_from_link(link):
+    m = re.search(r"/r/([A-Za-z0-9_]+)/", link or "")
+    return m.group(1) if m else None
+
+
+def strip_sub_prefix(sub):
+    s = sub.strip().rstrip("/")
+    return re.sub(r"^/?r/", "", s, flags=re.I)
+
+
+ID36_RE = re.compile(r"^[a-z0-9]{4,10}$")
+
+
+def parse_post_id(ident):
+    """Accept 1w78kp5, t3_1w78kp5, or any reddit permalink/shortlink."""
+    s = ident.strip()
+    m = re.match(r"^t3_([a-z0-9]+)$", s, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"/comments/([a-z0-9]+)", s, re.I)
+    if m:
+        return m.group(1)
+    m = re.match(r"^https?://(?:www\.|old\.|new\.)?(?:reddit\.com|redd\.it)/([a-z0-9]+)", s, re.I)
+    if m and ID36_RE.match(m.group(1)):
+        return m.group(1)
+    if ID36_RE.match(s):
+        return s
+    raise UsageError(
+        "cannot parse a post id from %r — use the post id (1w78kp5), fullname "
+        "(t3_1w78kp5) or its reddit.com URL" % ident)
+
+
+# --------------------------------------------------------------------------
+# Output formatting
+# --------------------------------------------------------------------------
+
+def char_width(s):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+
+def pad(s, width, right_align=False):
+    s = str(s if s is not None else "")
+    gap = width - char_width(s)
+    if gap <= 0:
+        return s
+    return (" " * gap + s) if right_align else (s + " " * gap)
+
+
+def truncate(s, width):
+    s = str(s if s is not None else "")
+    if char_width(s) <= width:
+        return s
+    out, w = "", 0
+    for c in s:
+        cw = 2 if unicodedata.east_asian_width(c) in "WF" else 1
+        if w + cw > width - 1:
+            break
+        out += c
+        w += cw
+    return out + "…"
+
+
+def render_table(headers, rows, aligns=None):
+    """rows: list of lists of strings already truncated-ready."""
+    widths = [char_width(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], char_width(str(cell)))
+    widths = [min(w, 60) for w in widths]
+    aligns = aligns or ["l"] * len(headers)
+    out = []
+    header_line = "  ".join(pad(h, widths[i]) for i, h in enumerate(headers))
+    out.append(header_line)
+    out.append("  ".join("-" * w for w in widths))
+    for row in rows:
+        cells = []
+        for i, cell in enumerate(row):
+            cell = truncate(cell, widths[i])
+            cells.append(pad(cell, widths[i], right_align=(aligns[i] == "r")))
+        out.append("  ".join(cells))
+    return "\n".join(out)
+
+
+def print_posts(posts, fmt, meta=None, table_title_key="title"):
+    if fmt == "json":
+        json.dump({"count": len(posts), "engine": meta,
+                   "note": "score/upvote_ratio come from the arctic-shift "
+                           "archive and may trail live values by a bit",
+                   "posts": posts}, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+        return
+    if fmt == "jsonl":
+        for p in posts:
+            sys.stdout.write(json.dumps(p, ensure_ascii=False) + "\n")
+        return
+    if fmt == "md":
+        for p in posts:
+            score = p.get("score")
+            score_s = "↑%s" % score if score is not None else "↑?"
+            ratio = (" (%d%%)" % (p["upvote_ratio"] * 100)) if p.get("upvote_ratio") else ""
+            sys.stdout.write("- %s%s · r/%s · %s · %s · [%s](%s)\n" % (
+                score_s, ratio, p.get("subreddit") or "?",
+                p.get("author") or "?", fmt_time(p.get("created_utc")),
+                (p.get(table_title_key) or "").replace("[", "(").replace("]", ")"),
+                p.get("permalink") or p.get("url") or ""))
+        return
+    # table
+    headers = ["score", "ratio", "comments", "date", "subreddit", "title",
+               "author", "id"]
+    rows = []
+    for p in posts:
+        rows.append([
+            p.get("score") if p.get("score") is not None else "·",
+            ("%d%%" % (p["upvote_ratio"] * 100)) if p.get("upvote_ratio") else "·",
+            p.get("num_comments") if p.get("num_comments") is not None else "·",
+            fmt_time(p.get("created_utc"))[:10] if p.get("created_utc") else "·",
+            p.get("subreddit") or "·",
+            truncate(p.get("title") or "", 46),
+            p.get("author") or "·",
+            p.get("id") or "·",
+        ])
+    out = [render_table(headers, rows, aligns=["r", "r", "r", "l", "l", "l", "l", "l"])]
+    if meta:
+        out.append("")
+        out.append("engine: %s · %d posts" % (meta, len(posts)))
+    sys.stdout.write("\n".join(out) + "\n")
+
+
+def print_subs(subs, fmt, meta=None):
+    if fmt == "json":
+        json.dump({"count": len(subs), "engine": meta, "subreddits": subs},
+                  sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+        return
+    if fmt == "jsonl":
+        for s in subs:
+            sys.stdout.write(json.dumps(s, ensure_ascii=False) + "\n")
+        return
+    if fmt == "md":
+        for s in subs:
+            sys.stdout.write("- **r/%s** — %s\n" % (s["name"], s.get("title") or ""))
+        return
+    headers = ["subreddit", "title", "created"]
+    rows = [[s["name"], truncate(s.get("title") or "", 52),
+             (s.get("created") or "")[:10]] for s in subs]
+    out = [render_table(headers, rows)]
+    if meta:
+        out.append("")
+        out.append("engine: %s · %d subreddits" % (meta, len(subs)))
+    sys.stdout.write("\n".join(out) + "\n")
+
+
+def print_post_detail(p, fmt):
+    if fmt == "json" or fmt == "jsonl":
+        json.dump(p, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+        return
+    if fmt == "md":
+        sys.stdout.write("# %s\n\n" % p.get("title"))
+        sys.stdout.write("- r/%s · u/%s · %s\n" % (
+            p.get("subreddit") or "?", p.get("author") or "?",
+            fmt_time(p.get("created_utc"))))
+        sys.stdout.write("- score: %s · upvote ratio: %s · comments: %s\n" % (
+            p.get("score"), p.get("upvote_ratio"), p.get("num_comments")))
+        sys.stdout.write("- permalink: %s\n" % p.get("permalink"))
+        if p.get("url"):
+            sys.stdout.write("- link: %s\n" % p["url"])
+        if p.get("selftext"):
+            sys.stdout.write("\n%s\n" % p["selftext"])
+        return
+    rows = [
+        ["title", p.get("title")],
+        ["subreddit", "r/" + (p.get("subreddit") or "?")],
+        ["author", "u/" + (p.get("author") or "?")],
+        ["created", fmt_time(p.get("created_utc"))],
+        ["score (upvotes)", p.get("score") if p.get("score") is not None else "n/a"],
+        ["upvote_ratio", p.get("upvote_ratio") if p.get("upvote_ratio") is not None else "n/a"],
+        ["num_comments", p.get("num_comments") if p.get("num_comments") is not None else "n/a"],
+        ["flair", p.get("flair") or "·"],
+        ["link", p.get("url") or "·"],
+        ["permalink", p.get("permalink") or "·"],
+        ["id", p.get("fullname") or p.get("id")],
+    ]
+    if p.get("score_source"):
+        rows.append(["score_source", p["score_source"] + " (may trail live value)"])
+    sys.stdout.write(render_table(["field", "value"], rows) + "\n")
+    if p.get("selftext"):
+        sys.stdout.write("\n%s\n%s\n%s\n" % ("-" * 60,
+                                             truncate(p["selftext"], 4000),
+                                             "-" * 60))
+
+
+def print_comments(comments, fmt, meta=None, tree=True):
+    ordered = comments
+    if tree and all(c.get("parent") is not None or c.get("is_top_level")
+                    for c in comments):
+        ordered = tree_order(comments)
+    if fmt == "json":
+        json.dump({"count": len(comments), "engine": meta,
+                   "comments": comments}, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+        return
+    if fmt == "jsonl":
+        for c in ordered:
+            sys.stdout.write(json.dumps(c, ensure_ascii=False) + "\n")
+        return
+    if fmt == "md":
+        for c in ordered:
+            depth = c.get("_depth", 0)
+            sys.stdout.write("%s- u/%s (score %s): %s\n" % (
+                "  " * depth, c.get("author") or "?",
+                c.get("score") if c.get("score") is not None else "?",
+                truncate((c.get("body") or "").replace("\n", " "), 200)))
+        return
+    headers = ["score", "author", "depth", "comment"]
+    rows = []
+    for c in ordered:
+        rows.append([
+            c.get("score") if c.get("score") is not None else "·",
+            c.get("author") or "·",
+            c.get("_depth", 0),
+            truncate((c.get("body") or "").replace("\n", " "), 68),
+        ])
+    out = [render_table(headers, rows, aligns=["r", "l", "r", "l"])]
+    if meta:
+        out.append("")
+        out.append("engine: %s · %d comments" % (meta, len(comments)))
+    sys.stdout.write("\n".join(out) + "\n")
+
+
+def tree_order(comments):
+    """Depth-first ordering with _depth markers using parent links."""
+    by_parent = {}
+    for c in comments:
+        key = c["parent"] if c.get("parent") else c.get("link_id") or "root"
+        by_parent.setdefault(key, []).append(c)
+    for kids in by_parent.values():
+        kids.sort(key=lambda c: -(c.get("score") or 0))
+    out = []
+
+    def walk(parent_key, depth):
+        for c in by_parent.get(parent_key, []):
+            if c in out:
+                continue
+            c["_depth"] = depth
+            out.append(c)
+            walk(c["id"], depth + 1)
+    # start from post itself + any orphan tops
+    walk(next((c["link_id"] for c in comments if c.get("link_id")), "root"), 0)
+    for c in comments:  # orphans whose parents fell outside the fetched window
+        if c not in out:
+            c["_depth"] = 0
+            out.append(c)
+    return out
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def default_format():
+    return "table" if sys.stdout.isatty() else "json"
+
+
+def add_common(p):
+    p.add_argument("--format", choices=["table", "json", "jsonl", "md"],
+                   default=None, help="output format (default: table on tty, "
+                                      "json when piped)")
+    p.add_argument("--engine",
+                   choices=["auto", "oauth", "redlib", "rss", "arctic"],
+                   default="auto",
+                   help="data engine (auto: oauth if ANY2CLI_REDDIT_CLIENT_ID "
+                        "is set, else redlib mirror → rss + archive scores → "
+                        "archive)")
+    p.add_argument("--limit", type=int, default=25, help="max items (default 25)")
+    p.add_argument("--cache-ttl", type=float, default=300,
+                   help="cache seconds (default 300; 0 = always refetch)")
+    p.add_argument("--fresh", action="store_true", help="bypass cache")
+    p.add_argument("--min-interval", type=float, default=None,
+                   help="min seconds between requests to one host "
+                        "(default rss %.0fs / others %.0fs)"
+                        % (MIN_INTERVAL["rss"], MIN_INTERVAL["arctic"]))
+    p.add_argument("--timeout", type=float, default=25.0)
+    p.add_argument("--no-enrich", action="store_true",
+                   help="skip arctic score lookups (rss engine only)")
+    p.add_argument("--verbose", "-v", action="store_true")
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="reddit",
+        description="Anonymous read-only Reddit CLI (any2cli example). "
+                    "No account, no API key. Scores come from the "
+                    "arctic-shift archive and may trail live values.",
+        epilog="examples:\n"
+               "  reddit posts r/python --sort top --time week --limit 15\n"
+               "  reddit search 'rust vs go' --sort top --time month\n"
+               "  reddit search asyncio --sub python\n"
+               "  reddit subs 'machine learning'\n"
+               "  reddit post 1w78kp5\n"
+               "  reddit comments 1w78kp5 --limit 50\n"
+               "  reddit user spez --kind comments\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version="%(prog)s " + VERSION)
+    sub = ap.add_subparsers(dest="cmd", metavar="command")
+
+    p = sub.add_parser("posts", help="list a subreddit's posts")
+    p.add_argument("subreddit", help="e.g. python or r/python")
+    p.add_argument("--sort", choices=REDDIT_SORTS, default="hot")
+    p.add_argument("--after", default=None, metavar="t3_ID",
+                   help="pagination cursor from a previous page (rss/oauth)")
+    p.add_argument("--time", "-t", choices=TIME_FILTERS, default=None,
+                   help="window for top/controversial")
+    add_common(p)
+
+    p = sub.add_parser("search", help="search posts (site-wide or in a subreddit)")
+    p.add_argument("query", help="search query")
+    p.add_argument("--sub", "-s", default=None,
+                   help="restrict search to this subreddit")
+    p.add_argument("--after", default=None, metavar="t3_ID",
+                   help="pagination cursor from a previous page (rss/oauth)")
+    p.add_argument("--sort", choices=SEARCH_SORTS, default="relevance")
+    p.add_argument("--time", "-t", choices=TIME_FILTERS, default=None)
+    add_common(p)
+
+    p = sub.add_parser("subs", help="find subreddits by keyword")
+    p.add_argument("query")
+    add_common(p)
+
+    p = sub.add_parser("post", help="one post with upvotes, ratio, selftext")
+    p.add_argument("id", help="post id, t3_ fullname, or reddit URL")
+    add_common(p)
+
+    p = sub.add_parser("comments", help="comments for a post, with scores")
+    p.add_argument("id", help="post id, t3_ fullname, or reddit URL")
+    p.add_argument("--sort", choices=COMMENT_SORTS, default=None,
+                   help="comment order (redlib engine applies it server-side)")
+    p.add_argument("--flat", action="store_true",
+                   help="print in engine order, no tree indentation")
+    add_common(p)
+
+    p = sub.add_parser("user", help="a user's recent posts and/or comments")
+    p.add_argument("name", help="username (u/ prefix ok)")
+    p.add_argument("--kind", choices=["posts", "comments", "overview"],
+                   default="posts")
+    add_common(p)
+
+    return ap
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if not args.cmd:
+        build_parser().print_help()
+        return 2
+    fmt = args.format or default_format()
+    http = Http(cache_ttl=max(args.cache_ttl, 0), fresh=args.fresh,
+                timeout=args.timeout, min_interval=args.min_interval,
+                verbose=args.verbose)
+    api = Reddit(http)
+
+    try:
+        if args.cmd == "posts":
+            posts, meta = api.posts(args.subreddit, sort=args.sort,
+                                    t=args.time, limit=args.limit,
+                                    enrich=not args.no_enrich,
+                                    engine=args.engine,
+                                    after=getattr(args, "after", None))
+            if not posts:
+                raise NotFound("no posts returned for r/%s (banned, private "
+                               "or empty?)" % strip_sub_prefix(args.subreddit))
+            print_posts(posts, fmt, meta)
+        elif args.cmd == "search":
+            posts, meta = api.search(args.query, sub=args.sub, sort=args.sort,
+                                     t=args.time, limit=args.limit,
+                                     enrich=not args.no_enrich,
+                                     engine=args.engine,
+                                     after=getattr(args, "after", None))
+            if not posts:
+                raise NotFound("no results for %r" % args.query)
+            print_posts(posts, fmt, meta)
+        elif args.cmd == "subs":
+            subs, meta = api.subs(args.query, limit=args.limit)
+            if not subs:
+                raise NotFound("no subreddits matched %r" % args.query)
+            print_subs(subs, fmt, meta)
+        elif args.cmd == "post":
+            print_post_detail(api.post(args.id, engine=args.engine), fmt)
+        elif args.cmd == "comments":
+            comments, meta = api.comments(args.id, limit=args.limit,
+                                          sort=getattr(args, "sort", None),
+                                          engine=args.engine)
+            if not comments:
+                raise NotFound("no comments found for t3_%s (too new, empty, "
+                               "or locked)" % parse_post_id(args.id))
+            print_comments(comments, fmt, meta, tree=not getattr(args, "flat", False))
+        elif args.cmd == "user":
+            items, meta = api.user(args.name, kind=args.kind,
+                                   limit=args.limit,
+                                   enrich=not args.no_enrich,
+                                   engine=args.engine)
+            if not items:
+                raise NotFound("nothing found for u/%s" % args.name)
+            if args.kind == "comments":
+                print_comments(items, fmt, meta, tree=False)
+            else:
+                print_posts(items, fmt, meta)
+    except CliError as e:
+        log(str(e))
+        return e.exit_code
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
