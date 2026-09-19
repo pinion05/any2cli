@@ -119,6 +119,33 @@ Verification: `examples/reddit/smoke-test.sh` (live-runs every subcommand).
   if a JS challenge still blocks you, the IP is flagged — use a different
   engine or a mirror, don't fight the challenge.
 
+## Worked example 2: `ncafe` (read Naver Cafe anonymously)
+
+`examples/ncafe/` — single-file Python 3 CLI (stdlib only), zero accounts,
+zero API keys. Two commands covering the two user intents:
+
+```bash
+ncafe search 캠핑 --sort date          # ARTICLES across ALL naver cafes
+ncafe search 캠핑카 --where trade      # trade articles only
+ncafe cafes 레트로게임                 # find CAFES by name + description
+```
+
+What it demonstrates beyond the reddit example:
+
+- **SSR site, no browser needed**: the probe proved the page is server-rendered
+  and the infinite-scroll XHR (`s.search.naver.com/p/cafe/48/...`) answers
+  anonymous curl with an honest UA — the browser was used to *discover* the
+  endpoint, then dropped entirely.
+- **Soft rate-limit contract**: Naver returns HTTP 200 with an EMPTY body when
+  throttled — detected by body length, not status code; retry → engine
+  fallback (www SSR) → exit 3.
+- **Pagination honestly scoped**: `start=` only pages when a browser-issued
+  `nlu_query` accompanies it; the CLI documents one-page-per-invocation
+  instead of faking deep pagination.
+
+Probing record: [examples/ncafe/KNOWHOW.md](examples/ncafe/KNOWHOW.md).
+Verification: `examples/ncafe/smoke-test.sh` (9/9 live, 2026-09-19).
+
 ## When NOT to use this skill
 
 - A mature official CLI already exists (`gh`, `notion`, `vastai`) — use it.
