@@ -354,6 +354,13 @@ def emit_detail(record, comments, engine, fmt):
         payload["comments"] = comments
         payload["comment_count"] = len(comments)
         print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif fmt == "jsonl":
+        rec = dict(record)
+        rec["engine"] = engine
+        rec["comment_count"] = len(comments)
+        print(json.dumps(rec, ensure_ascii=False))
+        for c in comments:
+            print(json.dumps(c, ensure_ascii=False))
     elif fmt == "md":
         print("## %s\n" % record.get("title"))
         print("%s · %s · 조회 %s 추천 %s\n" % (record.get("nick"), record.get("date"), fmt_int(record.get("views")), fmt_int(record.get("recommends"))))
