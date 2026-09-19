@@ -146,6 +146,31 @@ What it demonstrates beyond the reddit example:
 Probing record: [examples/ncafe/KNOWHOW.md](examples/ncafe/KNOWHOW.md).
 Verification: `examples/ncafe/smoke-test.sh` (9/9 live, 2026-09-19).
 
+## Worked example 3: `dc` (read DC Inside anonymously)
+
+`examples/dc/` — Korean community portal, no accounts, no cookies, stdlib
+HTTP only. The interesting part is the comment engine: comments live behind
+an XHR whose form the site's `comment.js` builds — recovered by reading the
+JS source, then capturing the browser's real POST body via a direct CDP
+websocket (`Network.requestWillBeSent.postData`), then replaying it
+sessionless. The form's `e_s_n_o` token turned out to be shared/static —
+no cookie jar needed at all.
+
+```bash
+dc posts programming --page 2        # gallery list, notices stripped
+dc search programming 파이썬 --field all
+dc post programming 2939751          # body + nested comment tree (depth)
+dc posts minor:ai                    # minor galleries (mgallery) too
+```
+
+Notable inversions documented in its KNOWHOW: mobile UA is required for
+*browser* access but **blocked** on the plain-HTTP surface (honest tool UA
+passes); the "combined search" is a Daum proxy and useless; mini galleries
+are member-only so unsupported.
+
+Probing record: [examples/dc/KNOWHOW.md](examples/dc/KNOWHOW.md).
+Verification: `examples/dc/smoke-test.sh` (9/9 live, 2026-09-19).
+
 ## When NOT to use this skill
 
 - A mature official CLI already exists (`gh`, `notion`, `vastai`) — use it.

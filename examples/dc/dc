@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""dc — anonymous DC Inside gallery reader CLI.
+
+Reads DC Inside galleries (lists, search, article views, comment trees)
+with zero accounts, zero cookies, stdlib-only HTTP. Verified 2026-09-19
+(see KNOWHOW.md):
+
+  - Main galleries   gall.dcinside.com/board/lists/?id=<gid>
+  - Minor galleries  gall.dcinside.com/mgallery/board/lists/?id=<gid>
+  - Both SSR with honest UA; mobile UA is BLOCKED on the HTTP surface
+    (inverse of the CDP skill's browser rule — that applies to real
+    browsers; this CLI sends a tool UA and passes).
+  - Comments: POST gall.dcinside.com/board/comment/ with the exact form
+    the site's comment.js sends (cmt_id/cmt_no/sort=D/prevCnt empty);
+    e_s_n_o is a shared static token per gallery-page generation — the
+    same value works sessionless, cookieless.
+
+Contract: any2cli (formats table|json|jsonl|md, exit 0/2/3/4, disk cache
++throttle). Browser fallback intentionally NOT wired (CDP is heavy);
+on block the CLI exits 3 with a hint.
+"""
+import argparse
+import hashlib
+import html as htmlmod
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "0.1.0"
+UA = "dc-cli/" + VERSION + " (anonymous dcinside gallery reader; personal research; no account)"
+TOOL = "dc"
+CACHE_DIR = os.path.expanduser("~/.cache/any2cli/" + TOOL)
+THROTTLE_FILE = os.path.join(CACHE_DIR, "throttle.json")
+MIN_INTERVAL = 4.0
+HOST = "gall.dcinside.com"
+
+GALLERY_KINDS = {
+    "main": "https://gall.dcinside.com/board/lists/",
+    "minor": "https://gall.dcinside.com/mgallery/board/lists/",
+}
+SEARCH_TYPES = {"subject": "search_subject", "all": "search_all", "nick": "search_name", "content": "search_memo"}
+
+
+def log(msg):
+    print("[" + TOOL + "] " + msg, file=sys.stderr)
+
+
+# ---------------------------------------------------------------- plumbing
+def disk_state(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def throttle_wait():
+    if os.environ.get("DC_NO_THROTTLE"):
+        return
+    state = disk_state(THROTTLE_FILE, {})
+    last = state.get(HOST, 0)
+    wait = MIN_INTERVAL - (time.time() - last)
+    if wait > 0:
+        wait = min(wait * 1.1, 25.0)
+        if os.environ.get("DC_VERBOSE"):
+            log("throttle: sleeping %.1fs" % wait)
+        time.sleep(wait)
+    state[HOST] = time.time()
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(THROTTLE_FILE, "w") as f:
+        json.dump(state, f)
+
+
+def cache_get(url):
+    ttl = int(os.environ.get("DC_TTL", "300"))
+    if ttl <= 0 or os.environ.get("DC_FRESH"):
+        return None
+    key = hashlib.sha256(url.encode()).hexdigest()
+    path = os.path.join(CACHE_DIR, key + ".json")
+    try:
+        with open(path) as f:
+            blob = json.load(f)
+        if time.time() - blob["ts"] <= ttl:
+            if os.environ.get("DC_VERBOSE"):
+                log("cache hit: " + url[:90])
+            return blob["body"]
+    except Exception:
+        pass
+    return None
+
+
+def cache_put(url, body):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    key = hashlib.sha256(url.encode()).hexdigest()
+    with open(os.path.join(CACHE_DIR, key + ".json"), "w") as f:
+        json.dump({"ts": time.time(), "url": url, "body": body}, f)
+
+
+class Blocked(Exception):
+    pass
+
+
+def http_get(url):
+    body = cache_get(url)
+    if body is not None:
+        return body
+    throttle_wait()
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "text/html"})
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=25) as r:
+                body = r.read().decode("utf-8", "replace")
+            if len(body) < 500:
+                # tiny body = redirect shim / soft block
+                if "location.replace" in body:
+                    m = re.search(r'location\.replace\("([^"]+)"\)', body)
+                    if m:  # follow one JS redirect (e.g. mgallery→board canonicalization)
+                        return http_get(m.group(1) if m.group(1).startswith("http") else "https://gall.dcinside.com" + m.group(1))
+                raise Blocked("tiny body (%d bytes)" % len(body))
+            cache_put(url, body)
+            return body
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise SystemExit(4)
+            if e.code in (429, 403):
+                raise Blocked("HTTP %d" % e.code)
+            if attempt == 2:
+                raise
+            time.sleep(3 * (attempt + 1))
+        except Blocked:
+            if attempt == 2:
+                raise
+            time.sleep(8)
+    raise Blocked("unreachable")
+
+
+def http_post(url, form):
+    key = "POST:" + url + "?" + form
+    body = cache_get(key)
+    if body is not None:
+        return body
+    throttle_wait()
+    data = form.encode()
+    req = urllib.request.Request(url, data=data, headers={
+        "User-Agent": UA,
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Referer": "https://gall.dcinside.com/",
+        "X-Requested-With": "XMLHttpRequest",
+    })
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=25) as r:
+                body = r.read().decode("utf-8", "replace")
+            if "정상적인 접근이 아닙니다" in body or len(body) < 20:
+                raise Blocked("comment endpoint rejected the form")
+            cache_put(key, body)
+            return body
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 403):
+                raise Blocked("HTTP %d" % e.code)
+            if attempt == 2:
+                raise
+            time.sleep(8)
+        except Blocked:
+            if attempt == 2:
+                raise
+            time.sleep(8)
+    raise Blocked("unreachable")
+
+
+def strip_tags(s):
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = htmlmod.unescape(s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+# ---------------------------------------------------------------- engines
+def list_url(kind, gid, page, s_type=None, keyword=None):
+    base = GALLERY_KINDS[kind]
+    p = {"id": gid, "page": str(page)}
+    if keyword:
+        p["s_type"] = SEARCH_TYPES[s_type or "subject"]
+        p["s_keyword"] = keyword
+    return base + "?" + urllib.parse.urlencode(p)
+
+
+def esno_from(html_body):
+    m = re.search(r'name="e_s_n_o"[^>]*value="([^"]+)"', html_body)
+    return m.group(1) if m else ""
+
+
+def fetch_list(kind, gid, page, s_type, keyword):
+    url = list_url(kind, gid, page, s_type, keyword)
+    body = http_get(url)
+    if "gall" not in body[:2000] and "<title>" not in body:
+        raise Blocked("list page lost markup")
+    return body
+
+
+def fetch_view(kind, gid, no):
+    base = "https://gall.dcinside.com/board/view/" if kind == "main" else "https://gall.dcinside.com/mgallery/board/view/"
+    return http_get(base + "?id=%s&no=%d" % (urllib.parse.quote(gid), no))
+
+
+def fetch_comments(kind, gid, no, esno, page=1):
+    form = urllib.parse.urlencode({
+        "id": gid, "no": str(no), "cmt_id": gid, "cmt_no": str(no),
+        "focus_cno": "", "focus_pno": "", "e_s_n_o": esno,
+        "comment_page": str(page), "sort": "D", "prevCnt": "",
+        "board_type": "", "_GALLTYPE_": "M" if kind == "minor" else "G",
+        "secret_article_key": "", "clean": "", "nptest": "",
+    })
+    body = http_post("https://gall.dcinside.com/board/comment/", form)
+    try:
+        return json.loads(body)
+    except ValueError:
+        raise Blocked("comment response not JSON")
+
+
+# ---------------------------------------------------------------- parsing
+ROW_RE = re.compile(r'<tr class="([^"]*)"[^>]*data-no="(\d+)"[^>]*>([\s\S]*?)</tr>')
+
+
+def parse_list(body):
+    items = []
+    for cls, num, content in ROW_RE.findall(body):
+        if 'icon_notice' in content:
+            continue  # 공지 제거 — 사용자는 실제 글을 원함
+        d = {"num": int(num)}
+        t = re.search(r'<td class="gall_tit ub-word">\s*<a\s+href="([^"]+)"[^>]*>([\s\S]*?)</a>', content)
+        if not t:
+            continue
+        d["url"] = "https://gall.dcinside.com" + t.group(1)
+        d["title"] = strip_tags(t.group(2))
+        w = re.search(r'data-nick="([^"]*)"[^>]*data-uid="([^"]*)"[^>]*data-ip="([^"]*)"', content)
+        if w:
+            d["nick"], d["uid"], d["ip"] = w.group(1), w.group(2), w.group(3)
+        dt = re.search(r'<td class="gall_date" title="([^"]+)">', content)
+        d["date"] = dt.group(1) if dt else None
+        cnt = re.search(r'<td class="gall_count">([\d,]+)</td>', content)
+        d["views"] = int(cnt.group(1).replace(",", "")) if cnt else None
+        rec = re.search(r'<td class="gall_recommend">([\d,]+)</td>', content)
+        d["recommends"] = int(rec.group(1).replace(",", "")) if rec else None
+        rep = re.search(r'reply_num">\[(\d+)\]', content)
+        d["comments"] = int(rep.group(1)) if rep else 0
+        d["has_img"] = "icon_pic" in content
+        items.append(d)
+    return items
+
+
+def parse_view(body):
+    out = {}
+    subj = re.search(r'<span class="title_subject[^"]*"[^>]*>([\s\S]*?)</span>', body)
+    out["title"] = strip_tags(subj.group(1)) if subj else None
+    w = re.search(r'data-nick="([^"]*)"[^>]*data-uid="([^"]*)"[^>]*data-ip="([^"]*)"[^>]*data-loc="view"', body)
+    if w:
+        out["nick"], out["uid"], out["ip"] = w.group(1), w.group(2), w.group(3)
+    dt = re.search(r'<span class="gall_date"[^>]*title="([^"]+)"', body) or re.search(r'class="gall_date"[^>]*>([^<]+)<', body)
+    if dt:
+        out["date"] = dt.group(1).strip()
+    # 본문: write_div 내부에서 텍스트만
+    i = body.find('class="write_div"')
+    if i > -1:
+        gt = body.find(">", i)  # skip the opening tag itself
+        seg = body[gt + 1:]
+        end = min(x for x in [seg.find('class="btn_delete"'), seg.find('id="comment_wrap'), 30000] if x > -1)
+        seg = seg[:end]
+        seg = re.sub(r'<script[\s\S]*?</script>', " ", seg)
+        # 추천/공유 버튼박스부터는 본문 아님 — '추천검색' 마커 전까지
+        cut = seg.find("추천검색")
+        if cut > -1:
+            seg = seg[:cut]
+        out["body_text"] = strip_tags(seg)[:2000]
+        out["images"] = [m for m in re.findall(r'src="(https://dcimg\d*\.dcinside\.[a-z]+/viewimage\.php\?[^"]+)"', seg)][:5]
+    cnt = re.search(r'gall_count">조회\s*([\d,]+)', body)
+    if cnt:
+        out["views"] = int(cnt.group(1).replace(",", ""))
+    rec = re.search(r'gall_recommend">([\d,]+)', body)
+    if rec:
+        out["recommends"] = int(rec.group(1).replace(",", ""))
+    return out
+
+
+def parse_comments(cjson):
+    items = []
+    for c in cjson.get("comments", []):
+        items.append({
+            "no": int(c["no"]),
+            "nick": c.get("name"),
+            "ip": c.get("ip") or None,
+            "user_id": c.get("user_id") or None,
+            "date": c.get("reg_date"),
+            "memo": c.get("memo"),
+            "rcnt": int(c.get("rcnt") or 0),  # 대댓글 수
+            "depth": int(c.get("depth") or 0),
+            "deleted": c.get("is_delete") != "0" and c.get("del_yn") == "Y",
+        })
+    return items
+
+
+# ---------------------------------------------------------------- output
+def dwidth(s):
+    import unicodedata
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in (s or ""))
+
+
+def pad(s, n):
+    return (s or "") + " " * max(0, n - dwidth(s))
+
+
+def trunc(s, n):
+    s = s or ""
+    return s if dwidth(s) <= n else s[: n - 1] + "…"
+
+
+def fmt_int(v):
+    return format(v, ",") if v is not None else "·"
+
+
+def emit_posts(items, engine, fmt, extra=None):
+    if fmt == "json":
+        payload = {"count": len(items), "engine": engine, "items": items}
+        if extra:
+            payload.update(extra)
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif fmt == "jsonl":
+        for it in items:
+            print(json.dumps(it, ensure_ascii=False))
+    elif fmt == "md":
+        for it in items:
+            print("- **%s** — %s (%s) · 👁%s 👍%s 💬%s\n  %s" % (
+                it["title"], it.get("nick"), it.get("date"),
+                fmt_int(it.get("views")), fmt_int(it.get("recommends")), it.get("comments", 0), it["url"]))
+    else:
+        for it in items:
+            print("%s %s %s %5s %4s %3s%s %s" % (
+                pad(str(it["num"]), 8), pad(trunc(it["title"], 34), 36),
+                pad(trunc(it.get("nick") or "?", 8), 18),
+                fmt_int(it.get("views")), fmt_int(it.get("recommends")),
+                it.get("comments", 0), " 🖼" if it.get("has_img") else "",
+                (it.get("date") or "")[:10]))
+        print("engine: %s · %d items" % (engine, len(items)))
+
+
+def emit_detail(record, comments, engine, fmt):
+    if fmt == "json":
+        payload = dict(record)
+        payload["engine"] = engine
+        payload["comments"] = comments
+        payload["comment_count"] = len(comments)
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif fmt == "md":
+        print("## %s\n" % record.get("title"))
+        print("%s · %s · 조회 %s 추천 %s\n" % (record.get("nick"), record.get("date"), fmt_int(record.get("views")), fmt_int(record.get("recommends"))))
+        print((record.get("body_text") or "")[:1000] + "\n")
+        print("### 댓글 (%d)\n" % len(comments))
+        for c in comments:
+            indent = "  " * c["depth"]
+            print("%s- **%s** (%s): %s" % (indent, c["nick"], c["date"], (c["memo"] or "")[:160]))
+    else:
+        print("제목: %s" % record.get("title"))
+        print("작성자: %s (ip:%s) · %s" % (record.get("nick"), record.get("ip"), record.get("date")))
+        print("조회 %s · 추천 %s" % (fmt_int(record.get("views")), fmt_int(record.get("recommends"))))
+        print("--- 본문 ---")
+        print((record.get("body_text") or "")[:900])
+        print("--- 댓글 %d개 ---" % len(comments))
+        for c in comments[:40]:
+            print("%s%s (%s) [%s]: %s" % ("  " * c["depth"], c["nick"], c["date"], c["ip"] or "-", (c["memo"] or "")[:90]))
+
+
+# ---------------------------------------------------------------- main
+def resolve_kind(gid_spec):
+    """Accept 'programming', 'minor:ai', 'mgallery id' spellings."""
+    kind = "main"
+    gid = gid_spec
+    if gid_spec.startswith("minor:"):
+        kind, gid = "minor", gid_spec[6:]
+    elif gid_spec.startswith("m:"):
+        kind, gid = "minor", gid_spec[2:]
+    return kind, gid
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(
+        prog=TOOL,
+        description="Anonymous DC Inside gallery reader (lists/search/view/comments).",
+        epilog="""examples:
+  dc posts programming                          # main gallery list (page 1)
+  dc posts programming --page 2                 # pagination (verified working)
+  dc posts minor:ai --limit 10                  # minor gallery (mgallery)
+  dc search programming 파이썬                  # search in gallery (subject)
+  dc search programming 파이썬 --field all      # subject+content+nick
+  dc post programming 2939751                   # view + comments
+  dc post programming 2939751 --comments 100    # more comments
+""")
+    ap.add_argument("--version", action="version", version="%(prog)s " + VERSION)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p1 = sub.add_parser("posts", help="gallery listing (notices stripped)")
+    p1.add_argument("gallery", help="gallery id, or 'minor:<id>' / 'm:<id>' for 마이너갤")
+    p1.add_argument("--page", type=int, default=1)
+    p1.add_argument("--limit", type=int, default=25)
+
+    p2 = sub.add_parser("search", help="keyword search inside a gallery")
+    p2.add_argument("gallery")
+    p2.add_argument("keyword")
+    p2.add_argument("--field", choices=["subject", "all", "nick", "content"], default="subject")
+    p2.add_argument("--page", type=int, default=1)
+    p2.add_argument("--limit", type=int, default=25)
+
+    p3 = sub.add_parser("post", help="one article: body + comment tree")
+    p3.add_argument("gallery")
+    p3.add_argument("no", type=int, help="article number (from posts/search output)")
+    p3.add_argument("--comments", type=int, default=50, help="max comments to fetch (pages of ~50+)")
+    p3.add_argument("--no-comments", action="store_true")
+
+    for p in (p1, p2, p3):
+        p.add_argument("--format", "--output-format", dest="fmt",
+                       choices=["table", "json", "jsonl", "md"], default=None)
+        p.add_argument("--fresh", action="store_true")
+        p.add_argument("--cache-ttl", type=int, default=300)
+
+    args = ap.parse_args(argv)
+    if args.fresh:
+        os.environ["DC_FRESH"] = "1"
+    os.environ["DC_TTL"] = str(args.cache_ttl)
+    fmt = args.fmt or ("table" if sys.stdout.isatty() else "json")
+
+    kind, gid = resolve_kind(args.gallery)
+
+    try:
+        if args.cmd in ("posts", "search"):
+            kw = args.keyword if args.cmd == "search" else None
+            st = args.field if args.cmd == "search" else None
+            body = fetch_list(kind, gid, args.page, st, kw)
+            items = parse_list(body)[: args.limit]
+            extra = {"gallery": gid, "kind": kind, "page": args.page}
+            if kw:
+                extra["keyword"] = kw
+                extra["field"] = st
+            emit_posts(items, "ssr-list", fmt, extra)
+            if not items:
+                sys.exit(4)
+        else:
+            vb = fetch_view(kind, gid, args.no)
+            record = parse_view(vb)
+            record["gallery"] = gid
+            record["num"] = args.no
+            comments = []
+            if not args.no_comments:
+                esno = esno_from(vb)
+                remaining = args.comments
+                page = 1
+                while remaining > 0:
+                    cj = fetch_comments(kind, gid, args.no, esno, page)
+                    got = parse_comments(cj)
+                    if not got:
+                        break
+                    comments.extend(got[:remaining])
+                    remaining -= len(got)
+                    total = cj.get("total_cnt", 0)
+                    if len(comments) >= total:
+                        break
+                    page += 1
+                    if page > 20:
+                        break
+            emit_detail(record, comments, "ssr-view+comment-json", fmt)
+            if not record.get("title"):
+                sys.exit(4)
+    except Blocked as e:
+        log("blocked: %s — retry later or reduce --limit; browser fallback not wired (CDP heavy)" % e)
+        sys.exit(3)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
