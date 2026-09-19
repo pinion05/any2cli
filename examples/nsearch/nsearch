@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""nsearch — anonymous Naver News + Blog search CLI.
+
+Two surfaces, both anonymous (no cookies, honest UA), verified 2026-09-19
+(see KNOWHOW.md):
+
+  news  s.search.naver.com/p/newssearch/3/api/tab/more   — the news tab's
+        own infinite-scroll JSON ({"collection":[{"html":...}]}). Params:
+        start (1-based, ~10/page, WORKS unlike the www surface), sort=0 rel
+        / 1 recent, pd=N days (period filter, -1 = all).
+        The 2026 news tab renders with "fender-ui" components — parsing
+        anchors on data-heatmap-target=".tit" (stable) instead of the old
+        news_tit classes.
+  blog  search.naver.com?ssc=tab.blog SSR — same .tit anchors; blog links
+        come as ader.naver.com redirects which are resolved (1 HEAD-ish
+        request each) to real blog.naver.com URLs. Deeper blog pagination
+        is NOT reachable anonymously (see KNOWHOW §limits).
+
+Contract: any2cli (formats, exit codes, disk cache+throttle).
+"""
+import argparse
+import hashlib
+import html as htmlmod
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "0.1.0"
+UA = "nsearch/" + VERSION + " (anonymous naver news+blog search wrapper; personal research)"
+TOOL = "nsearch"
+CACHE_DIR = os.path.expanduser("~/.cache/any2cli/" + TOOL)
+THROTTLE_FILE = os.path.join(CACHE_DIR, "throttle.json")
+MIN_INTERVAL = 5.0
+
+NEWS_MORE = "https://s.search.naver.com/p/newssearch/3/api/tab/more"
+BLOG_WWW = "https://search.naver.com/search.naver"
+
+
+def log(msg):
+    print("[" + TOOL + "] " + msg, file=sys.stderr)
+
+
+def strip_tags(s):
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = htmlmod.unescape(s)
+    s = re.sub(r"<[^>]+>", " ", s)  # entities may decode to tags (alt attr text)
+    s = htmlmod.unescape(s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+# ---------------------------------------------------------------- plumbing
+def disk_state(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def throttle_wait(host):
+    if os.environ.get("NSEARCH_NO_THROTTLE"):
+        return
+    state = disk_state(THROTTLE_FILE, {})
+    last = state.get(host, 0)
+    wait = MIN_INTERVAL - (time.time() - last)
+    if wait > 0:
+        wait = min(wait * 1.1, 25.0)
+        if os.environ.get("NSEARCH_VERBOSE"):
+            log("throttle: sleeping %.1fs for %s" % (wait, host))
+        time.sleep(wait)
+    state[host] = time.time()
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(THROTTLE_FILE, "w") as f:
+        json.dump(state, f)
+
+
+def cache_get(key):
+    ttl = int(os.environ.get("NSEARCH_TTL", "300"))
+    if ttl <= 0 or os.environ.get("NSEARCH_FRESH"):
+        return None
+    k = hashlib.sha256(key.encode()).hexdigest()
+    try:
+        with open(os.path.join(CACHE_DIR, k + ".json")) as f:
+            blob = json.load(f)
+        if time.time() - blob["ts"] <= ttl:
+            if os.environ.get("NSEARCH_VERBOSE"):
+                log("cache hit: " + key[:90])
+            return blob["body"]
+    except Exception:
+        pass
+    return None
+
+
+def cache_invalidate(key):
+    k = hashlib.sha256(key.encode()).hexdigest()
+    try:
+        os.remove(os.path.join(CACHE_DIR, k + ".json"))
+    except OSError:
+        pass
+
+
+def cache_put(key, body):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    k = hashlib.sha256(key.encode()).hexdigest()
+    with open(os.path.join(CACHE_DIR, k + ".json"), "w") as f:
+        json.dump({"ts": time.time(), "url": key, "body": body}, f)
+
+
+class Blocked(Exception):
+    pass
+
+
+def http_get(url, referer=None):
+    body = cache_get(url)
+    if body is not None:
+        return body
+    host = urllib.parse.urlparse(url).netloc
+    throttle_wait(host)
+    headers = {"User-Agent": UA, "Accept": "text/html,application/json"}
+    if referer:
+        headers["Referer"] = referer
+    req = urllib.request.Request(url, headers=headers)
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=25) as r:
+                body = r.read().decode("utf-8", "replace")
+            if not body.strip():
+                raise Blocked("200 empty body (soft rate-limit)")
+            cache_put(url, body)
+            return body
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                sys.exit(4)
+            if e.code in (429, 403):
+                raise Blocked("HTTP %d" % e.code)
+            if attempt == 2:
+                raise
+            time.sleep(3 * (attempt + 1))
+        except Blocked:
+            if attempt == 2:
+                raise
+            time.sleep(9)
+    raise Blocked("unreachable")
+
+
+def resolve_ader(url):
+    """ader.naver.com redirect -> real blog url (no body fetch)."""
+    real = cache_get("ADER:" + url)
+    if real is not None:
+        return real
+    throttle_wait("ader.naver.com")
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Referer": "https://search.naver.com/"})
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+
+    opener = urllib.request.build_opener(NoRedirect)
+    try:
+        opener.open(req, timeout=15)
+        return url  # no redirect happened
+    except urllib.error.HTTPError as e:
+        loc = e.headers.get("Location")
+        if loc:
+            cache_put("ADER:" + url, loc)
+            return loc
+        return url
+    except Exception:
+        return url
+
+
+# ---------------------------------------------------------------- parsing
+DATE_RE = r'\d+\s*(?:시간|일|분)\s*전|\d{4}\.\d{2}\.\d{2}\.?'
+
+
+def tit_blocks(html_text):
+    """Split on stable .tit anchors; each block = one result card."""
+    positions = [m.start() for m in re.finditer(r'<a\s+[^>]*data-heatmap-target="\.tit"', html_text)]
+    blocks = []
+    for idx, pos in enumerate(positions):
+        end = positions[idx + 1] if idx + 1 < len(positions) else min(pos + 40000, len(html_text))
+        blocks.append(html_text[pos:end])
+    return blocks
+
+
+def parse_card(blk):
+    a = re.search(r'href="([^"]+)"', blk)
+    href = a.group(1).replace("&amp;", "&") if a else None
+    anchor_end = blk.find("</a>")
+    title = strip_tags(blk[:anchor_end]).replace("새 창 열림", "").strip()
+    # press (news): profile image alt is the stable marker
+    press = None
+    m = re.search(r'alt="([^"]{2,20})의 프로필 이미지"', blk)
+    if m:
+        press = m.group(1)
+    # date
+    md = re.search(DATE_RE, strip_tags(blk[anchor_end:]))
+    date = md.group(0) if md else None
+    # press fallback: text right before the date (news cards)
+    if not press and date:
+        texts = [t.strip() for t in re.findall(r'>([^<>]{2,30})<', blk) if t.strip() and t.strip() != "새 창 열림"]
+        for i, t in enumerate(texts):
+            if re.fullmatch(DATE_RE, t):
+                for j in range(i - 1, -1, -1):
+                    cand = texts[j]
+                    if len(cand) <= 14 and not re.match(r'^[A-Z]?\d+면', cand) and cand != "네이버뉴스":
+                        press = cand
+                        break
+                break
+    # blogger (blog cards): date-form 2026.08.25. preceded by blogger name
+    blogger = None
+    if date and re.match(r'\d{4}\.', date):
+        texts = [t.strip() for t in re.findall(r'>([^<>]{1,40})<', blk) if t.strip() and t.strip() != "새 창 열림"]
+        for i, t in enumerate(texts):
+            if re.fullmatch(r'\d{4}\.\d{2}\.\d{2}\.?', t):
+                for j in range(i - 1, -1, -1):
+                    if not texts[j].isdigit() and len(texts[j]) <= 16:
+                        blogger = texts[j]
+                        break
+                break
+    # snippet: longest sentence between title and date
+    snippet = None
+    if date:
+        flat = strip_tags(blk[anchor_end:])
+        di = flat.find(date)
+        mid = flat[:di] if di > 0 else flat
+        if press:
+            mid = mid.replace(press, "")
+        cands = [s.strip() for s in re.split(r'(?<=[\.\?!…])\s', mid) if len(s.strip()) > 40]
+        snippet = cands[0][:220] if cands else None
+    # naver news url (mnews link inside card)
+    nv = re.search(r'href="(https://n\.news\.naver\.com/mnews/article/[^"]+?)"', blk)
+    return {
+        "title": title,
+        "url": href,
+        "naver_url": nv.group(1) if nv else None,
+        "press": press,
+        "blogger": blogger,
+        "date": date,
+        "snippet": snippet,
+    }
+
+
+def dedupe(items):
+    seen = set()
+    out = []
+    for it in items:
+        key = it.get("title") or it.get("url")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
+
+
+# ---------------------------------------------------------------- engines
+def fetch_news(query, start, sort, pd_days):
+    params = {
+        "query": query, "start": str(start), "sort": str(sort),
+        "ssc": "tab.news.all", "pd": str(pd_days),
+        "photo": "0", "field": "0", "mynews": "0", "rev": "0",
+    }
+    url = NEWS_MORE + "?" + urllib.parse.urlencode(params)
+    body = http_get(url, referer="https://search.naver.com/search.naver")
+    try:
+        data = json.loads(body)
+    except ValueError:
+        raise Blocked("news more returned non-JSON")
+    if not data.get("collection"):
+        # transient null response — must not poison the cache
+        cache_invalidate(url)
+        raise Blocked("news more returned empty collection (transient)")
+    htmls = [c.get("html", "") for c in data["collection"]]
+    items = []
+    for hh in htmls:
+        for blk in tit_blocks(hh):
+            items.append(parse_card(blk))
+    return dedupe(items)
+
+
+def fetch_blogs(query):
+    url = BLOG_WWW + "?" + urllib.parse.urlencode({"ssc": "tab.blog", "query": query})
+    body = http_get(url)
+    items = []
+    # (a) cards with a direct blog.naver.com thumbnail anchor (.simg) —
+    #     title comes from the img alt ("...의 이미지"), meta from card texts
+    simg_pos = [m.start() for m in re.finditer(r'<a[^>]*data-heatmap-target="\.simg"[^>]*href="(https://blog\.naver\.com/[^"]+)"', body)]
+    seen_urls = set()
+    for idx, m in enumerate(re.finditer(r'<a[^>]*data-heatmap-target="\.simg"[^>]*href="(https://blog\.naver\.com/[^"]+)"', body)):
+        pos = m.start()
+        end = simg_pos[idx + 1] if idx + 1 < len(simg_pos) else min(pos + 25000, len(body))
+        blk = body[pos:end]
+        u = m.group(1).split("?")[0]
+        if u in seen_urls:
+            continue
+        seen_urls.add(u)
+        alt = re.search(r'alt="([^"]{8,300}?)의 이미지"', blk)
+        title = strip_tags(alt.group(1)).strip() if alt else None
+        texts = [t.strip() for t in re.findall(r'>([^<>]{1,40})<', blk) if t.strip() and t.strip() != "새 창 열림"]
+        date = next((t for t in texts if re.fullmatch(r'\d{4}\.\d{2}\.\d{2}\.?', t)), None)
+        blogger = None
+        if date:
+            idx_d = texts.index(date)
+            for j in range(idx_d - 1, -1, -1):
+                if not texts[j].isdigit() and len(texts[j]) <= 16 and not re.search(r'\d{4}\.', texts[j]):
+                    blogger = texts[j]
+                    break
+        items.append({"title": title, "url": u, "naver_url": None, "press": None,
+                      "blogger": blogger, "date": date, "snippet": None, "kind": "blog"})
+    # (b) ader.naver.com .tit cards (redirect-resolved)
+    for blk in tit_blocks(body):
+        it = parse_card(blk)
+        if not it["url"]:
+            continue
+        if "ader.naver.com" in it["url"]:
+            real = resolve_ader(it["url"]).split("?")[0]
+            if real in seen_urls:
+                continue
+            seen_urls.add(real)
+            it["url"] = real
+            it["kind"] = "blog"
+            items.append(it)
+    # (c) official-blog .link cards: title is INSIDE the .link anchor
+    for m in re.finditer(r'<a\s+([^>]*?)href="(https://blog\.naver\.com/[A-Za-z0-9_]+/\d+[^"]*)"([^>]*?)>([\s\S]*?)</a>', body):
+        attrs = m.group(1) + m.group(3)
+        if 'data-heatmap-target=".link"' not in attrs:
+            continue
+        u = m.group(2).split("?")[0]
+        if u in seen_urls:
+            continue
+        seen_urls.add(u)
+        title = strip_tags(m.group(4)).replace("새 창 열림", "").strip()
+        blogger = None
+        if "blog.naver.com" in title or "›" in title or "sds-comp" in title or "svg" in title:
+            # profile/noisy anchor: blogger first, real title further in the card —
+            # try img alt ("...의 이미지") within the card tail, else next text
+            parts = title.split("›")
+            blogger = parts[0].replace("blog.naver.com", "").strip() or None
+            tail = body[m.end():m.end() + 5000]
+            alt = re.search(r'alt="([^"]{8,300}?)의 이미지"', tail)
+            if alt:
+                title = strip_tags(alt.group(1)).strip()
+            else:
+                after = strip_tags(body[m.end():m.end() + 600])
+                tm = re.search(r'([^\n]{15,140}?)(?:새 창 열림|$)', after)
+                title = (tm.group(1).strip() if tm else title)
+        before = body[max(0, m.start() - 800):m.start()]
+        dm = re.search(r'\d+\s*(?:시간|일|주|개월|년)\s*전|\d{4}\.\d{2}\.\d{2}\.?', strip_tags(before))
+        items.append({"title": title[:140], "url": u, "naver_url": None, "press": None,
+                      "blogger": blogger, "date": dm.group(0) if dm else None,
+                      "snippet": None, "kind": "blog"})
+    return dedupe(items)
+
+
+# ---------------------------------------------------------------- output
+def dwidth(s):
+    import unicodedata
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in (s or ""))
+
+
+def pad(s, n):
+    return (s or "") + " " * max(0, n - dwidth(s))
+
+
+def trunc(s, n):
+    s = s or ""
+    return s if dwidth(s) <= n else s[: n - 1] + "…"
+
+
+def emit(items, engine, fmt, extra=None):
+    if fmt == "json":
+        payload = {"count": len(items), "engine": engine, "items": items}
+        if extra:
+            payload.update(extra)
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif fmt == "jsonl":
+        for it in items:
+            print(json.dumps(it, ensure_ascii=False))
+    elif fmt == "md":
+        for it in items:
+            who = it.get("press") or it.get("blogger") or "?"
+            print("- **%s** — %s (%s)\n  %s" % (it["title"], who, it.get("date") or "", it.get("url")))
+            if it.get("snippet"):
+                print("  > %s" % it["snippet"][:160])
+    else:
+        for it in items:
+            who = it.get("press") or it.get("blogger") or "?"
+            print("%s %s %s %s" % (
+                pad(trunc(it["title"], 44), 46), pad(who, 12),
+                pad(it.get("date") or "·", 11), trunc(it.get("snippet") or "", 40)))
+        print("engine: %s · %d items" % (engine, len(items)))
+
+
+# ---------------------------------------------------------------- main
+def main(argv):
+    ap = argparse.ArgumentParser(
+        prog=TOOL,
+        description="Anonymous Naver News + Blog search.",
+        epilog="""examples:
+  nsearch news 인공지능                          # news, relevance
+  nsearch news 인공지능 --sort recent            # newest first
+  nsearch news 인공지능 --days 7                 # last week
+  nsearch news 인공지능 --start 11               # next page (verified)
+  nsearch blogs 캠핑텐트                          # blog posts (top page)
+""")
+    ap.add_argument("--version", action="version", version="%(prog)s " + VERSION)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p1 = sub.add_parser("news", help="search news articles")
+    p1.add_argument("query")
+    p1.add_argument("--sort", choices=["rel", "recent"], default="rel")
+    p1.add_argument("--days", type=int, default=-1, help="period filter in days (-1 = all, 7 = week)")
+    p1.add_argument("--start", type=int, default=1, help="1-based result offset (~10/page)")
+    p1.add_argument("--limit", type=int, default=20)
+
+    p2 = sub.add_parser("blogs", help="search blog posts (single top page, anonymous limit)")
+    p2.add_argument("query")
+    p2.add_argument("--limit", type=int, default=10)
+
+    for p in (p1, p2):
+        p.add_argument("--format", "--output-format", dest="fmt",
+                       choices=["table", "json", "jsonl", "md"], default=None)
+        p.add_argument("--fresh", action="store_true")
+        p.add_argument("--cache-ttl", type=int, default=300)
+
+    args = ap.parse_args(argv)
+    if args.fresh:
+        os.environ["NSEARCH_FRESH"] = "1"
+    os.environ["NSEARCH_TTL"] = str(args.cache_ttl)
+    fmt = args.fmt or ("table" if sys.stdout.isatty() else "json")
+
+    try:
+        if args.cmd == "news":
+            items = fetch_news(args.query, args.start, 0 if args.sort == "rel" else 1, args.days)
+            items = items[: args.limit]
+            emit(items, "news-more-json", fmt,
+                 extra={"query": args.query, "sort": args.sort,
+                        "note": "~10 items/page via start (works); press/date parsed from fender-ui cards"})
+            if not items:
+                sys.exit(4)
+        else:
+            items = fetch_blogs(args.query)[: args.limit]
+            emit(items, "blog-www-ssr+ader-resolve", fmt,
+                 extra={"query": args.query,
+                        "note": "single top page anonymously; ader.naver.com links resolved to blog.naver.com"})
+            if not items:
+                sys.exit(4)
+    except Blocked as e:
+        log("blocked: %s — wait ~10s or reduce queries" % e)
+        sys.exit(3)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

@@ -171,6 +171,27 @@ are member-only so unsupported.
 Probing record: [examples/dc/KNOWHOW.md](examples/dc/KNOWHOW.md).
 Verification: `examples/dc/smoke-test.sh` (9/9 live, 2026-09-19).
 
+## Worked example 4: `nsearch` (anonymous Naver News + Blog search)
+
+`examples/nsearch/` — reuses the ncafe discovery (s.search XHR family) for
+the news tab: `p/newssearch/3/api/tab/more` answers anonymously and its
+`start=` pagination actually WORKS (unlike the www surface). The parsing
+challenge is the 2026 fender-ui migration: old selectors (`news_tit`) are
+dead; the CLI anchors on stable attributes (`data-heatmap-target=".tit"`,
+profile-image alt text) instead of obfuscated CSS hashes. Two traps worth
+stealing: transient `{"collection": null}` responses must not poison the
+cache, and blog links arrive as `ader.naver.com` redirects resolved via
+the `Location` header alone (no body fetch).
+
+```bash
+nsearch news 인공지능 --sort recent --days 7   # filters verified live
+nsearch news 인공지능 --start 11               # next page
+nsearch blogs 캠핑텐트                          # top blog cards
+```
+
+Probing record: [examples/nsearch/KNOWHOW.md](examples/nsearch/KNOWHOW.md).
+Verification: `examples/nsearch/smoke-test.sh` (9/9 live, 2026-09-19).
+
 ## When NOT to use this skill
 
 - A mature official CLI already exists (`gh`, `notion`, `vastai`) — use it.
