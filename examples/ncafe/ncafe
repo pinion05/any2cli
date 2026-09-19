@@ -110,7 +110,9 @@ class NotFound(Exception):
     pass
 
 
-def http_get(url, ttl=300):
+def http_get(url, ttl=None):
+    if ttl is None:
+        ttl = int(os.environ.get("NCAFE_TTL", "300"))
     body = cache_get(url, ttl)
     if body is not None:
         return body
@@ -169,7 +171,7 @@ def build_params(query, where, sort, date_option, start):
 def engine_ssearch(params):
     qs = urllib.parse.urlencode(params)
     url = "https://s.search.naver.com/p/cafe/48/search.naver?" + qs
-    body = http_get(url, ttl=300)
+    body = http_get(url)
     try:
         data = json.loads(body)
     except ValueError:
@@ -187,7 +189,7 @@ def engine_www(params):
     p.pop("display", None)
     qs = urllib.parse.urlencode(p)
     url = "https://search.naver.com/search.naver?" + qs
-    body = http_get(url, ttl=300)
+    body = http_get(url)
     if "title_link" not in body and "cafe_head_inner" not in body:
         raise Blocked("www page has no result markup")
     return body
@@ -288,27 +290,40 @@ def parse_cafes(html):
 def out_table_articles(items):
     lines = []
     for it in items:
-        cafe = (it["cafe"] or "?")[:18]
         mark = "*" if it["official"] else " "
-        lines.append("%s %-42s %-18s %-8s %s" % (
-            mark, trunc(it["title"], 42), cafe, it["date"] or "·",
-            (it["snippet"] or "")[:56]))
+        lines.append("%s %s %s %s %s" % (
+            mark, pad(trunc(it["title"], 20), 42), pad(trunc(it["cafe"] or "?", 10), 20),
+            pad(it["date"] or "·", 10), trunc(it["snippet"] or "", 40)))
     return lines
 
 
 def out_table_cafes(items):
     lines = []
     for it in items:
-        lines.append("%-30s %10s %-8s %8s %s" % (
-            trunc(it["name"] or "?", 30), fmt_int(it["members"]),
-            it["rank_tier"] or "·", fmt_int(it["new_posts"]),
-            trunc(it["description"] or "", 50)))
+        lines.append("%s %9s %-10s %7s %s" % (
+            pad(trunc(it["name"] or "?", 15), 31), fmt_int(it["members"]),
+            pad(it["rank_tier"] or "·", 8), fmt_int(it["new_posts"]),
+            trunc(it["description"] or "", 46)))
     return lines
 
 
 def trunc(s, n):
     s = s or ""
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def dwidth(s):
+    """Display width: CJK/fullwidth count double (contract: width-aware padding)."""
+    import unicodedata
+    w = 0
+    for ch in s:
+        w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return w
+
+
+def pad(s, n):
+    """Pad to display width n."""
+    return s + " " * max(0, n - dwidth(s))
 
 
 def fmt_int(v):
