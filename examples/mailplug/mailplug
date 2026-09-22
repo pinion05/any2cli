@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+"""mailplug — 라이브몰로 메일플러그 그룹웨어 웹메일 CLI.
+
+Private-API wrapper (NOT anonymous — personal account, cookie-auth).
+IMAP/POP3 is relay-blocked by the provider (553), so this CLI rides the
+groupware web API instead. Verified 2026-09-22 (see KNOWHOW.md):
+
+  GET    m59.mailplug.com/api/v2/mail/mailboxes
+  GET    m59.mailplug.com/api/v2/mail/mailboxes/{id}/messages?limit&search&searchTarget
+  GET    m59.mailplug.com/api/v2/mail/mailboxes/{id}/messages/{mid}
+  PATCH  m59.mailplug.com/api/v2/mail/mailboxes/{id}/messages/{mid}  {"messageFlag":"Y"}
+  POST   m59.mailplug.com/api/v2/mail/sendMail  {"transferMode":"send",...}
+
+Auth: .mailplug.com cookies (MP_SES/MP_AUT/MP_TAG — session cookies).
+The CLI auto-extracts cookies from the local Chrome CDP session
+(port 9222, cloned profile) when they expire; login itself requires the
+browser (Cloudflare Turnstile on the login form), so relogin is delegated
+to `agent-browser` if a password file exists.
+
+Contract: any2cli (formats table|json|jsonl|md, exit 0/2/3/4, disk cache
++throttle).
+"""
+import argparse
+import hashlib
+import html as htmlmod
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "0.1.0"
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/145.0.0.0 Safari/537.36")  # cookie-auth personal tool; browser-like UA required by API
+TOOL = "mailplug"
+CACHE_DIR = os.path.expanduser("~/.cache/any2cli/" + TOOL)
+THROTTLE_FILE = os.path.join(CACHE_DIR, "throttle.json")
+MIN_INTERVAL = 1.0
+API = "https://m59.mailplug.com/api/v2/mail"
+COOKIE_FILE = os.path.join(CACHE_DIR, "cookies.json")
+PASS_FILE = os.path.expanduser("~/.config/mailplug-cli/secret")  # optional: password for auto-relogin
+CDP_PORT = "9222"
+
+# mailbox aliases -> mailboxId (from live /mailboxes response)
+FOLDERS = {
+    "inbox": 1, "sent": 2, "drafts": 4, "spam": 5, "trash": 3,
+    "self": 0, "all": "allmail", "unread": "unread", "starred": "starred",
+}
+FOLDER_LABEL = {
+    "inbox": "받은편지함", "sent": "보낸편지함", "drafts": "임시보관함",
+    "spam": "스팸편지함", "trash": "휴지통", "self": "내게쓴편지함",
+    "all": "전체메일", "unread": "안읽음", "starred": "중요",
+}
+
+
+def log(msg):
+    print("[" + TOOL + "] " + msg, file=sys.stderr)
+
+
+# ---------------------------------------------------------------- cookies
+def cookies_from_cdp():
+    """Pull .mailplug.com cookies from the local Chrome CDP endpoint."""
+    try:
+        out = subprocess.run(
+            ["agent-browser", "--cdp", CDP_PORT, "--json", "cookies", "get"],
+            capture_output=True, text=True, timeout=30)
+        data = json.loads(out.stdout)
+        cookies = data.get("data", {}).get("cookies", [])
+    except Exception as e:
+        log("CDP cookie pull failed: %s" % e)
+        return None
+    keep = {}
+    for c in cookies:
+        dom = c.get("domain", "")
+        if dom.endswith("mailplug.com"):
+            keep[c["name"]] = c["value"]
+    need = ("MP_SES", "MP_AUT", "MP_TAG")
+    if all(k in keep for k in need):
+        return keep
+    return None
+
+
+def try_relogin():
+    """Session dead and CDP has no cookies: attempt browser relogin via agent-browser."""
+    if not os.path.exists(PASS_FILE):
+        return False
+    pw = open(PASS_FILE).read().strip()
+    if not pw:
+        return False
+    cmds = [
+        ["agent-browser", "--cdp", CDP_PORT, "open", "https://login.mailplug.com/"],
+    ]
+    for c in cmds:
+        subprocess.run(c, capture_output=True, timeout=60)
+    time.sleep(3)
+    try:
+        subprocess.run(["agent-browser", "--cdp", CDP_PORT, "fill", "#login_input", "mcpark@livemolo.me"],
+                       capture_output=True, timeout=30)
+        subprocess.run(["agent-browser", "--cdp", CDP_PORT, "press", "Enter"], capture_output=True, timeout=30)
+        time.sleep(3)
+        subprocess.run(["agent-browser", "--cdp", CDP_PORT, "fill", "#password", pw],
+                       capture_output=True, timeout=30)
+        subprocess.run(["agent-browser", "--cdp", CDP_PORT, "click", "#loginButton"], capture_output=True, timeout=30)
+        time.sleep(4)
+    except Exception as e:
+        log("relogin failed: %s" % e)
+        return False
+    return cookies_from_cdp() is not None
+
+
+def cookie_header():
+    """Return Cookie header string; refresh from CDP (and relogin) when missing."""
+    cached = None
+    try:
+        blob = json.load(open(COOKIE_FILE))
+        if time.time() - blob.get("ts", 0) < 3600:
+            cached = blob["cookies"]
+    except Exception:
+        pass
+    if cached:
+        return "; ".join("%s=%s" % kv for kv in cached.items())
+    fresh = cookies_from_cdp()
+    if not fresh:
+        if try_relogin():
+            fresh = cookies_from_cdp()
+    if not fresh:
+        raise SystemExit(3)
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    json.dump({"ts": time.time(), "cookies": fresh}, open(COOKIE_FILE, "w"))
+    return "; ".join("%s=%s" % kv for kv in fresh.items())
+
+
+def drop_cookie_cache():
+    try:
+        os.remove(COOKIE_FILE)
+    except FileNotFoundError:
+        pass
+
+
+# ---------------------------------------------------------------- plumbing
+def disk_state(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def throttle_wait():
+    if os.environ.get("MAILPLUG_NO_THROTTLE"):
+        return
+    state = disk_state(THROTTLE_FILE, {})
+    last = state.get(API, 0)
+    wait = MIN_INTERVAL - (time.time() - last)
+    if wait > 0:
+        time.sleep(wait)
+    state[API] = time.time()
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(THROTTLE_FILE, "w") as f:
+        json.dump(state, f)
+
+
+def cache_get(url):
+    ttl = int(os.environ.get("MAILPLUG_TTL", "60"))
+    if ttl <= 0 or os.environ.get("MAILPLUG_FRESH"):
+        return None
+    key = hashlib.sha256(url.encode()).hexdigest()
+    path = os.path.join(CACHE_DIR, key + ".json")
+    try:
+        with open(path) as f:
+            blob = json.load(f)
+        if time.time() - blob["ts"] <= ttl:
+            if os.environ.get("MAILPLUG_VERBOSE"):
+                log("cache hit: " + url[:90])
+            return blob["body"]
+    except Exception:
+        pass
+    return None
+
+
+def cache_put(url, body):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    key = hashlib.sha256(url.encode()).hexdigest()
+    with open(os.path.join(CACHE_DIR, key + ".json"), "w") as f:
+        json.dump({"ts": time.time(), "url": url, "body": body}, f)
+
+
+def api_request(method, url, payload=None, cached=True):
+    """Authenticated JSON call. 401/redirect => refresh cookies once and retry."""
+    if cached and method == "GET":
+        hit = cache_get(url)
+        if hit is not None:
+            return hit
+    body = None
+    hdrs = {
+        "User-Agent": UA,
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://gw.mailplug.com/",
+        "Origin": "https://gw.mailplug.com",
+    }
+    if payload is not None:
+        body = json.dumps(payload, ensure_ascii=False).encode()
+        hdrs["Content-Type"] = "application/json"
+    for attempt in range(2):
+        hdrs["Cookie"] = cookie_header()
+        req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=25) as r:
+                text = r.read().decode("utf-8", "replace")
+                data = json.loads(text) if text.strip() else {}
+            if method == "GET" and cached:
+                cache_put(url, data)
+            return data
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                drop_cookie_cache()
+                continue  # retry with refreshed cookies
+            if e.code == 404 or (e.code == 400 and method == "GET"):
+                raise SystemExit(4)  # not found / invalid id path
+            if e.code in (429, 403) and attempt:
+                raise SystemExit(3)
+            raise
+        except ValueError:
+            # non-empty non-JSON body = login page/HTML error → auth surface,
+            # but only fatal when we expected JSON (GET/POST). PATCH may legally
+            # return empty (handled above), so anything reaching here is HTML.
+            raise SystemExit(3)
+    drop_cookie_cache()
+    raise SystemExit(3)
+
+
+# ---------------------------------------------------------------- helpers
+def strip_mailplug_html(raw):
+    """mailplug wraps bodies in <mailplughtml>...; reduce to plain text."""
+    if not raw:
+        return ""
+    s = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", raw)
+    s = s.replace("<br", "\n<br").replace("</p>", "\n</p>").replace("</div>", "\n</div>")
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = htmlmod.unescape(s)
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n\s*\n\s*\n+", "\n\n", s)
+    return s.strip()
+
+
+def kst(iso):
+    """2026-09-21T08:51:24Z -> 26-09-21 17:51 (KST, +9)."""
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})", iso or "")
+    if not m:
+        return iso or ""
+    y, mo, d, h, mi = (int(x) for x in m.groups())
+    eh, emi = h + 9, mi
+    if eh >= 24:
+        eh -= 24
+        d += 1
+    return "%02d-%02d-%02d %02d:%02d" % (y % 100, mo, d, eh, emi)
+
+
+# ---------------------------------------------------------------- commands
+def folder_id(spec):
+    if spec in FOLDERS:
+        return FOLDERS[spec]
+    if spec.isdigit():
+        return int(spec)
+    raise SystemExit(2)
+
+
+def cmd_folders(args):
+    data = api_request("GET", API + "/mailboxes")
+    rows = []
+    for b in data.get("value", []):
+        rows.append({
+            "id": b.get("id"), "name": b.get("displayName"),
+            "unread": b.get("unreadCount"), "total": b.get("messageCount"),
+            "alias": next((a for a, i in FOLDERS.items() if str(i) == str(b.get("id"))), None),
+        })
+    emit(rows, "folders", args.format)
+    return 0
+
+
+def list_messages(fid, limit, search, target, unread_only):
+    q = {"limit": str(limit)}
+    if search:
+        q["search"] = search
+        q["searchTarget"] = target
+    url = API + "/mailboxes/%s/messages?%s" % (fid, urllib.parse.urlencode(q))
+    data = api_request("GET", url)
+    rows = []
+    for m in data.get("value", []):
+        if unread_only and m.get("messageFlag") != "N":
+            continue
+        frm = m.get("fromRecipient") or {}
+        flag = m.get("messageFlag")
+        rows.append({
+            "id": m.get("messageId"),
+            "subject": m.get("subject"),
+            "from": (frm.get("displayName") or frm.get("emailAddress") or ""),
+            "from_email": frm.get("emailAddress"),
+            "date": kst(m.get("receivedDateTime")),
+            "iso": m.get("receivedDateTime"),
+            "unread": flag == "N",  # N=안읽음, Y=읽음 (실측 2026-09-22)
+            "starred": bool(m.get("isStarred")),
+            "attach": bool(m.get("hasAttachments")),
+            "size_kb": m.get("mailSize"),
+        })
+    return rows
+
+
+def cmd_list(args):
+    rows = list_messages(folder_id(args.folder), args.limit, args.search, args.target, args.unread)
+    emit(rows, "list", args.format)
+    return 0
+
+
+def cmd_read(args):
+    detail = api_request("GET", API + "/mailboxes/%s/messages/%s" % (folder_id(args.folder), args.id))
+    rec = {
+        "id": detail.get("messageId"),
+        "subject": detail.get("subject"),
+        "from": [(r.get("displayName") or "", r.get("emailAddress")) for r in detail.get("toRecipients", [])],
+        # note: detail response carries toRecipients; from lives on list rows
+        "date": kst(detail.get("receivedDateTime")),
+        "iso": detail.get("receivedDateTime"),
+        "body_text": strip_mailplug_html(detail.get("body"))[:8000],
+    }
+    if args.mark_read:
+        api_request("PATCH", API + "/mailboxes/%s/messages/%s" % (folder_id(args.folder), args.id),
+                    payload={"messageFlag": "Y"}, cached=False)
+        rec["marked_read"] = True
+    emit_one(rec, "read", args.format)
+    return 0
+
+
+def cmd_send(args):
+    body_text = args.body if args.body else (open(args.body_file).read() if args.body_file else "")
+    payload = {
+        "transferMode": "send",
+        "sender": {"displayName": "박명철", "emailAddress": "mcpark@livemolo.me"},
+        "subject": args.subject,
+        "body": body_text.replace("\n", "<br>"),
+        "toRecipients": [{"isValid": True, "displayName": "", "emailAddress": a} for a in args.to],
+        "ccRecipients": [],
+        "bccRecipients": [],
+        "scheduleSend": {"type": "unit", "value": "0"},
+        "gradeMode": "normal",
+        "isMultiSend": True,
+        "sendMailSaveMode": "save",
+    }
+    if args.dry_run:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    resp = api_request("POST", API + "/sendMail", payload=payload, cached=False)
+    print(json.dumps({"sent": True, "to": args.to, "subject": args.subject,
+                      "resp": resp if isinstance(resp, (dict, list)) else str(resp)[:200]},
+                     ensure_ascii=False, indent=2))
+    return 0
+
+
+# ---------------------------------------------------------------- output
+def dwidth(s):
+    import unicodedata
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in (s or ""))
+
+
+def pad(s, n):
+    return (s or "") + " " * max(0, n - dwidth(s))
+
+
+def trunc(s, n):
+    s = s or ""
+    return s if dwidth(s) <= n else s[: n - 1] + "…"
+
+
+def emit(rows, kind, fmt):
+    if fmt == "json":
+        print(json.dumps({"count": len(rows), "engine": "web-api", "items": rows}, ensure_ascii=False, indent=2))
+    elif fmt == "jsonl":
+        for it in rows:
+            print(json.dumps(it, ensure_ascii=False))
+    elif fmt == "md":
+        for it in rows:
+            flags = (" 🔴" if it.get("unread") else "") + (" ⭐" if it.get("starred") else "") + (" 📎" if it.get("attach") else "")
+            print("- **%s** — %s <%s> · %s%s" % (it.get("subject"), it.get("from"), it.get("from_email"), it.get("date"), flags))
+    else:
+        for it in rows:
+            flags = ("●" if it.get("unread") else " ") + ("★" if it.get("starred") else " ") + ("📎" if it.get("attach") else "")
+            print("%s %s %s %s" % (
+                pad(str(it.get("id")), 6),
+                pad(trunc(it.get("from") or "?", 12), 14),
+                pad(trunc(it.get("subject") or "(제목없음)", 40), 42),
+                it.get("date", "")))
+            del flags
+        print("engine: web-api · %d items" % len(rows))
+
+
+def emit_one(rec, kind, fmt):
+    if fmt in ("json", "jsonl"):
+        out = dict(rec)
+        out["engine"] = "web-api"
+        print(json.dumps(out, ensure_ascii=False, indent=(2 if fmt == "json" else None)))
+    elif fmt == "md":
+        print("## %s\n" % rec.get("subject"))
+        print("%s · %s\n" % (rec.get("date"), rec.get("from")))
+        print(rec.get("body_text"))
+    else:
+        print("제목: %s" % rec.get("subject"))
+        print("날짜: %s" % rec.get("date"))
+        print("--- 본문 ---")
+        print(rec.get("body_text"))
+
+
+# ---------------------------------------------------------------- main
+def main(argv):
+    ap = argparse.ArgumentParser(
+        prog=TOOL,
+        description="라이브몰로 메일플러그 웹메일 CLI (cookie-auth via local Chrome CDP).",
+        epilog="""examples:
+  mailplug folders
+  mailplug list inbox --limit 10
+  mailplug list unread
+  mailplug list inbox --search 콘텐츠랩
+  mailplug read 36
+  mailplug read 36 --mark-read
+  mailplug send mcpark@livemolo.me --subject 제목 --body 본문
+  mailplug send a@b.com --subject 제목 --body-file body.txt --dry-run
+""")
+    ap.add_argument("--version", action="version", version="%(prog)s " + VERSION)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("folders", help="메일함 목록 (id/안읽음/개수)")
+    p.add_argument("--format", choices=["table", "json", "jsonl", "md"], default="table")
+
+    p = sub.add_parser("list", help="메일 목록")
+    p.add_argument("folder", nargs="?", default="inbox",
+                   help="inbox|sent|drafts|spam|trash|self|all|unread|starred 또는 숫자 id")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--search", help="검색어")
+    p.add_argument("--target", choices=["all", "subject", "from", "to"], default="all")
+    p.add_argument("--unread", action="store_true", help="안읽음만")
+    p.add_argument("--format", choices=["table", "json", "jsonl", "md"], default="table")
+
+    p = sub.add_parser("read", help="본문 보기")
+    p.add_argument("id", type=int, help="messageId (list에서 확인)")
+    p.add_argument("--folder", default="inbox")
+    p.add_argument("--mark-read", action="store_true", help="읽은 후 읽음 처리")
+    p.add_argument("--format", choices=["table", "json", "jsonl", "md"], default="table")
+
+    p = sub.add_parser("send", help="메일 발송")
+    p.add_argument("to", nargs="+", help="받는 사람 이메일 (복수 가능)")
+    p.add_argument("--subject", required=True)
+    p.add_argument("--body", help="본문 텍스트")
+    p.add_argument("--body-file", help="본문 파일")
+    p.add_argument("--dry-run", action="store_true", help="발송 안 하고 payload만 출력")
+
+    args = ap.parse_args(argv)
+    try:
+        return {"folders": cmd_folders, "list": cmd_list, "read": cmd_read, "send": cmd_send}[args.cmd](args)
+    except SystemExit as e:
+        code = e.code
+        if code == 3:
+            log("인증 실패 또는 차단 — Chrome CDP(9222) 세션으로 재로그인 필요. "
+                "agent-browser로 login.mailplug.com 로그인 후 재시도.")
+        raise
+    except urllib.error.URLError as e:
+        log("네트워크 오류: %s" % e)
+        raise SystemExit(3)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
