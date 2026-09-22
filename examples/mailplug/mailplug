@@ -273,12 +273,23 @@ def cmd_folders(args):
     data = api_request("GET", API + "/mailboxes")
     rows = []
     for b in data.get("value", []):
+        alias = next((a for a, i in FOLDERS.items() if str(i) == str(b.get("id"))), None)
         rows.append({
-            "id": b.get("id"), "name": b.get("displayName"),
-            "unread": b.get("unreadCount"), "total": b.get("messageCount"),
-            "alias": next((a for a, i in FOLDERS.items() if str(i) == str(b.get("id"))), None),
+            "id": b.get("id"),
+            "name": b.get("displayName"),
+            "unread": b.get("unreadCount"),
+            "total": b.get("messageCount"),
+            "alias": alias,
+            "label": FOLDER_LABEL.get(alias, b.get("displayName")),
         })
-    emit(rows, "folders", args.format)
+    if args.format == "table":
+        for it in rows:
+            print("%-16s %-14s %-12s %6s %6s" % (
+                str(it["id"]), it["alias"] or "-", trunc(it["name"] or "?", 12),
+                it["unread"] if it["unread"] else "", it["total"] if it["total"] else ""))
+        print("engine: web-api · %d folders" % len(rows))
+    else:
+        emit(rows, "folders", args.format)
     return 0
 
 
