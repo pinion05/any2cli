@@ -15,13 +15,17 @@ IMAP/POP3가 관리자 정책으로 막혀 있어(553 relay) 웹 내부 API를 �
 ```bash
 mailplug folders                          # 메일함 목록 (안읽음 카운트)
 mailplug list inbox --limit 10            # 받은 메일 최근 10통
+mailplug list inbox --page 2              # 다음 페이지 (offset)
 mailplug list unread                      # 안읽음만
 mailplug list inbox --search 콘텐츠랩     # 검색
-mailplug read 36                          # 본문 보기
+mailplug read 36                          # 본문 보기 (발신자 포함)
 mailplug read 36 --mark-read              # 읽고 읽음 처리
 mailplug send someone@example.com --subject 제목 --body 내용
 mailplug send a@b.com --subject 제목 --body-file letter.txt --dry-run
 ```
+
+본문 참고: `--body`의 HTML 태그는 그대로 렌더됨 (`<b>굵게</b>` 사용 가능,
+`<script>`는 서버가 제거). 줄바꿈은 자동 `<br>` 변환.
 
 출력 포맷: `--format table|json|jsonl|md` · exit: 0 성공 / 2 사용자 오류 /
 3 인증·차단 / 4 찾을 수 없음.

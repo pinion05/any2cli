@@ -130,6 +130,8 @@ def cookie_header():
     if not fresh:
         raise SystemExit(3)
     os.makedirs(CACHE_DIR, exist_ok=True)
+    if cached:
+        os.chmod(COOKIE_FILE, 0o600)  # 세션 쿠키 평문 방지
     json.dump({"ts": time.time(), "cookies": fresh}, open(COOKIE_FILE, "w"))
     return "; ".join("%s=%s" % kv for kv in fresh.items())
 
@@ -221,6 +223,15 @@ def api_request(method, url, payload=None, cached=True):
                 continue  # retry with refreshed cookies
             if e.code == 404 or (e.code == 400 and method == "GET"):
                 raise SystemExit(4)  # not found / invalid id path
+            if e.code == 400 and method == "POST":
+                # 서버 검증 오류 (예: {"error":{"code":730105,...}}) — 사용자 오류로 전달
+                try:
+                    err = json.loads(e.read().decode()) or {}
+                except Exception:
+                    err = {}
+                msg = (err.get("error") or {}).get("message") or e.reason
+                log("발송 거부됨: %s" % msg)
+                raise SystemExit(2)
             if e.code in (429, 403) and attempt:
                 raise SystemExit(3)
             raise
@@ -293,8 +304,9 @@ def cmd_folders(args):
     return 0
 
 
-def list_messages(fid, limit, search, target, unread_only):
-    q = {"limit": str(limit)}
+def list_messages(fid, limit, search, target, unread_only, page=1):
+    offset = max(0, (page - 1) * limit)
+    q = {"limit": str(limit), "offset": str(offset)}
     if search:
         q["search"] = search
         q["searchTarget"] = target
@@ -322,18 +334,26 @@ def list_messages(fid, limit, search, target, unread_only):
 
 
 def cmd_list(args):
-    rows = list_messages(folder_id(args.folder), args.limit, args.search, args.target, args.unread)
+    rows = list_messages(folder_id(args.folder), args.limit, args.search, args.target, args.unread, args.page)
     emit(rows, "list", args.format)
     return 0
 
 
 def cmd_read(args):
-    detail = api_request("GET", API + "/mailboxes/%s/messages/%s" % (folder_id(args.folder), args.id))
+    fid = folder_id(args.folder)
+    detail = api_request("GET", API + "/mailboxes/%s/messages/%s" % (fid, args.id))
+    # detail 응답에 발신자가 없다(실측) — 같은 폴더 목록에서 from을 병합
+    from_name = from_email = None
+    rows = list_messages(fid, 50, None, "all", False)
+    me = [r for r in rows if r["id"] == args.id]
+    if me:
+        from_name, from_email = me[0]["from"], me[0]["from_email"]
     rec = {
         "id": detail.get("messageId"),
         "subject": detail.get("subject"),
-        "from": [(r.get("displayName") or "", r.get("emailAddress")) for r in detail.get("toRecipients", [])],
-        # note: detail response carries toRecipients; from lives on list rows
+        "from": from_name,
+        "from_email": from_email,
+        "to": [(r.get("displayName") or "", r.get("emailAddress")) for r in detail.get("toRecipients", [])],
         "date": kst(detail.get("receivedDateTime")),
         "iso": detail.get("receivedDateTime"),
         "body_text": strip_mailplug_html(detail.get("body"))[:8000],
@@ -365,10 +385,12 @@ def cmd_send(args):
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
     resp = api_request("POST", API + "/sendMail", payload=payload, cached=False)
-    print(json.dumps({"sent": True, "to": args.to, "subject": args.subject,
-                      "resp": resp if isinstance(resp, (dict, list)) else str(resp)[:200]},
+    # 성공 스키마는 {"messageId": N} (실측). 빈 응답/messageId 없음 = 실패로 간주.
+    mid = resp.get("messageId") if isinstance(resp, dict) else None
+    print(json.dumps({"sent": bool(mid), "message_id": mid, "to": args.to, "subject": args.subject,
+                      "error": resp.get("error") if isinstance(resp, dict) and not mid else None},
                      ensure_ascii=False, indent=2))
-    return 0
+    return 0 if mid else 2
 
 
 # ---------------------------------------------------------------- output
@@ -449,6 +471,7 @@ def main(argv):
     p.add_argument("folder", nargs="?", default="inbox",
                    help="inbox|sent|drafts|spam|trash|self|all|unread|starred 또는 숫자 id")
     p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--page", type=int, default=1, help="페이지 (offset=(page-1)*limit)")
     p.add_argument("--search", help="검색어")
     p.add_argument("--target", choices=["all", "subject", "from", "to"], default="all")
     p.add_argument("--unread", action="store_true", help="안읽음만")

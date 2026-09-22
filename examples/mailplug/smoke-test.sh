@@ -89,10 +89,17 @@ OUT=$("$MP" send mcpark@livemolo.me --subject "cli-smoke $(date +%s)" --body "sm
 echo "$OUT" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
-assert d.get('sent') is True
-assert d.get('resp',{}).get('messageId')
+assert d.get('sent') is True, d
+assert d.get('message_id'), d
 sys.exit(0)"
 check "live send accepted" $?
+# 10b. response must be honest: no messageId → sent:false + exit 2 (schema change canary)
+echo "$OUT" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert set(d) >= {'sent','message_id','error'}, d.keys()
+sys.exit(0)"
+check "send response schema" $?
 sleep 4
 MAILPLUG_FRESH=1 "$MP" list self --limit 5 --format json 2>/dev/null | python3 -c "
 import json,sys
@@ -125,6 +132,49 @@ sys.exit(0)"
 else
   echo "skip mark-read round-trip (no unread message available)"
 fi
+
+# 3. pagination: --page 2 disjoint from page 1 (offset 실측 동작)
+python3 - << 'EOF'
+import subprocess, json, sys, os
+MP = os.path.expanduser("~/.agents/skills/any2cli/examples/mailplug/mailplug")
+env = dict(os.environ); env["MAILPLUG_TTL"] = "0"
+p1 = json.loads(subprocess.run([MP,"list","inbox","--limit","10","--page","1","--format","json"],capture_output=True,text=True,env=env).stdout or "{}")
+p2 = json.loads(subprocess.run([MP,"list","inbox","--limit","10","--page","2","--format","json"],capture_output=True,text=True,env=env).stdout or "{}")
+s1 = set(i["id"] for i in p1.get("items",[]))
+s2 = set(i["id"] for i in p2.get("items",[]))
+assert s1 and s2, "empty page"
+assert not (s1 & s2), "pages overlap: %s" % (s1 & s2)
+sys.exit(0)
+EOF
+check "pagination page2 disjoint" $?
+
+# 3b. page beyond end -> empty, not error
+"$MP" list inbox --limit 10 --page 99 --format json 2>/dev/null | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['count']==0, 'page99 should be empty'
+sys.exit(0)"
+check "page beyond end empty" $?
+
+# 12. invalid recipient -> exit 2 + stderr message (반증: 200 오탐 방지)
+OUT=$("$MP" send "not-an-email" --subject probe --body x 2>/tmp/mp_send_err.txt)
+CODE=$?
+grep -q "발송 거부" /tmp/mp_send_err.txt && [ "$CODE" -eq 2 ]
+check "invalid recipient -> exit 2 + msg" $?
+
+# 13. read shows sender (from 병합)
+"$MP" read 36 --format json 2>/dev/null | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d.get('from'), 'read missing from: %s' % d.get('from')
+sys.exit(0)"
+check "read includes sender" $?
+
+# 14. cookie cache file permission 600
+"$MP" folders >/dev/null 2>&1
+PERM=$(stat -c %a ~/.cache/any2cli/mailplug/cookies.json 2>/dev/null)
+[ "$PERM" = "600" ]
+check "cookie file 0600" $?
 
 echo "----"
 echo "pass=$pass fail=$fail"

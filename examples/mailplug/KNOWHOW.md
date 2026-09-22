@@ -36,6 +36,12 @@ IMAP LOGIN failed: NO 553 sorry, that password allowed relay (#5.7.5)
 
 ## 함정 (실측)
 
+- **발송 실패는 400 + `{"error":{"code":730105,"message":...}}`**: 빈 수신자·malformed 주소
+  모두 400으로 온다 (200 오탐 방지 — 성공은 `{"messageId":N}` 스키마로만 판정).
+- **본문 HTML 주의**: `<b>` 등 태그는 그대로 HTML로 렌더됨(의도적 사용 가능).
+  `<script>`는 서버가 자동 제거(살균). `&`는 엔티티로 써야 의도 렌더.
+- **페이지네이션은 `offset` 파라미터**: `?limit=10&offset=10` → 다음 10통.
+  `page` 파라미터는 무시됨. limit>전체개수면 전체 반환, limit<=0은 무시.
 - **PATCH 응답은 빈 본문**: `PATCH .../messages/{id}` `{"messageFlag":"Y"}`는
   200 + empty body. json.loads("") ValueError를 exit 3(인증실패)로 오판하지
   말 것 → 빈 본문은 `{}`로 처리.
