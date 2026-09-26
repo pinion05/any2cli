@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+"""x — anonymous X/Twitter read CLI.
+
+Engines:
+  synd  cdn.syndication.twimg.com/tweet-result   (tweet by id: likes, replies, parent)
+  cdp   x.com via agent-browser --cdp 9222        (views, replies with metrics, user profile)
+  ggl   google.com site:x.com search via CDP      (keyword tweet search)
+
+Exit codes: 0 ok · 2 usage · 3 blocked/rate-limited · 4 not found
+"""
+import argparse
+import hashlib
+import html as htmllib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+
+TOOL = "x"
+CDP = os.environ.get("ANY2CLI_X_CDP", "9222")
+CACHE_DIR = os.path.expanduser(f"~/.cache/any2cli/{TOOL}/")
+UA = f"{TOOL}-cli/1.0 (anonymous X reader; pinion05/any2cli)"
+
+# ---------------------------------------------------------------- helpers
+
+def die(code, msg):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def cache_get(key, ttl):
+    p = os.path.join(CACHE_DIR, hashlib.sha256(key.encode()).hexdigest() + ".json")
+    if ttl > 0 and os.path.exists(p):
+        try:
+            with open(p) as f:
+                blob = json.load(f)
+            if time.time() - blob["ts"] <= ttl:
+                return blob["body"], blob.get("engine", "")
+        except Exception:
+            pass
+    return None, None
+
+
+def cache_put(key, body, engine=""):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    p = os.path.join(CACHE_DIR, hashlib.sha256(key.encode()).hexdigest() + ".json")
+    try:
+        with open(p, "w") as f:
+            json.dump({"ts": time.time(), "url": key, "engine": engine, "body": body}, f)
+    except Exception:
+        pass
+
+
+def http_json(url, timeout=20):
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "ignore"))
+
+
+def cdp_eval(js, retries=2):
+    """Evaluate JS in the CDP browser. Returns python object or dies with code 3."""
+    for i in range(retries + 1):
+        p = subprocess.run(
+            ["agent-browser", "--cdp", CDP, "eval", js],
+            capture_output=True, text=True, timeout=60)
+        out = (p.stdout or "").strip()
+        if out.startswith('"'):
+            try:
+                return json.loads(json.loads(out))
+            except Exception:
+                pass
+        if out.startswith("{") or out.startswith("["):
+            try:
+                return json.loads(out)
+            except Exception:
+                pass
+        if p.returncode != 0 and i == retries:
+            die(3, f"engine=cdp: agent-browser failed: {(p.stderr or out)[:200]}")
+        time.sleep(1.5)
+    return None
+
+
+def cdp_open(url):
+    subprocess.run(["agent-browser", "--cdp", CDP, "open", url],
+                   capture_output=True, timeout=60)
+
+
+NUM = {"K": 1e3, "M": 1e6, "B": 1e9, "만": 1e4, "천": 1e3, "억": 1e8}
+
+def parse_count(s):
+    """'8.6만' '440+' '1.9만' '18.6K' '29' -> int (approx suffix + becomes lower bound)."""
+    if not s:
+        return None
+    s = s.strip().rstrip("+").replace(",", "")
+    m = re.match(r"^([\d.]+)\s*([KMB만천억])?$", s)
+    if not m:
+        return None
+    v = float(m.group(1))
+    suf = m.group(2)
+    if suf:
+        v *= NUM.get(suf, 1)
+    return int(v)
+
+
+def fmt_num(n):
+    if n is None:
+        return "·"
+    if n >= 1e8:
+        return f"{n/1e8:.1f}억"
+    if n >= 1e4:
+        return f"{n/1e4:.1f}만"
+    return str(n)
+
+
+# ---------------------------------------------------------------- engines
+
+TWEET_ID_RE = re.compile(r"(?:status|statuses)/(\d{15,25})")
+HANDLE_RE = re.compile(r"^@?([A-Za-z0-9_]{1,15})$")
+
+
+def parse_tweet_id(s):
+    m = TWEET_ID_RE.search(s)
+    if m:
+        return m.group(1)
+    if re.match(r"^\d{15,25}$", s):
+        return s
+    return None
+
+
+def parse_handle(s):
+    s = s.strip().rstrip("/")
+    m = HANDLE_RE.match(s)
+    if m:
+        return m.group(1)
+    m = re.search(r"(?:x|twitter)\.com/([A-Za-z0-9_]{1,15})(?:/|$|\?)", s)
+    if m and m.group(1).lower() not in ("i", "search", "home", "explore", "settings"):
+        return m.group(1)
+    return None
+
+
+def synd_tweet(tid):
+    """cdn.syndication tweet-result. Returns record or None."""
+    url = f"https://cdn.syndication.twimg.com/tweet-result?id={tid}&token=x&lang=en"
+    try:
+        d = http_json(url)
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 404):
+            return None
+        raise
+    u = d.get("user") or {}
+    return {
+        "id": d.get("id_str", tid),
+        "author": u.get("screen_name"),
+        "author_name": u.get("name"),
+        "verified": bool(u.get("verified") or u.get("is_blue_verified")),
+        "created_at": d.get("created_at"),
+        "text": d.get("text", ""),
+        "likes": d.get("favorite_count"),
+        "replies": d.get("conversation_count"),
+        "reply_to": d.get("in_reply_to_screen_name"),
+        "parent_id": (d.get("parent") or {}).get("id_str"),
+        "url": f"https://x.com/{u.get('screen_name')}/status/{tid}",
+        "engine": "synd",
+    }
+
+
+# ---- x.com page parsing (shared by tweet / user / search) ----------------
+
+PROFILE_JS = r"""(() => {
+  const t = document.body.innerText;
+  if (/Log in|Sign up/.test(t) && t.length < 400) return {"error": "login-wall"};
+  const head = t.split("\n").slice(0, 60).join("\n");
+  return {"text": head, "full_len": t.length};
+})()"""
+
+
+def _lines_from_cdp_text(blob):
+    return [l.strip() for l in (blob.get("text") or "").split("\n") if l.strip()]
+
+
+def cdp_tweet(tid, want_replies):
+    """Open a tweet page in CDP, return {tweet, replies[]}."""
+    cdp_open(f"https://x.com/i/status/{tid}?lang=en")
+    time.sleep(6)
+    cdp_eval("window.scrollTo(0, 3000)")
+    time.sleep(2)
+    blob = cdp_eval(
+        "JSON.stringify({t: document.body.innerText})")
+    raw = blob.get("t", "") if isinstance(blob, dict) else str(blob or "")
+    if len(raw) < 200 and ("Log in" in raw or "게시물" not in raw):
+        die(3, "engine=cdp: x.com login wall / empty page")
+    lines = [l.strip() for l in raw.split("\n") if l.strip()]
+
+    rec = {"id": tid, "engine": "cdp"}
+    # author: line after the big text block start — find @handle pattern
+    for i, l in enumerate(lines):
+        m = re.match(r"^@([A-Za-z0-9_]{1,15})$", l)
+        if m:
+            rec["author"] = m.group(1)
+            if i > 0 and not lines[i - 1].startswith("@"):
+                rec["author_name"] = lines[i - 1]
+            break
+    # date·time line ("2:34 AM · Sep 26, 2026" / "오후 2:34 · 2026년 9월 26일") = END of tweet text
+    time_idx = None
+    for i, l in enumerate(lines):
+        if "·" in l and re.search(r"\d{1,2}:\d{2}", l):
+            time_idx = i
+            rec["posted"] = l
+            break
+    # views: "·" line then number then 조회수/Views right after time line
+    if time_idx is not None:
+        j = time_idx + 1
+        while j < min(time_idx + 5, len(lines)):
+            if lines[j] == "·":
+                j += 1
+                continue
+            if re.match(r"^[\d.,]+[KMB만천]?\+?$", lines[j]):
+                rec["views"] = parse_count(lines[j])
+                j += 1
+                break
+            if lines[j] in ("조회수", "Views"):
+                break
+            break
+        # engagement: next 1-4 bare numbers after views block = replies, reposts, likes, bookmarks
+        nums = []
+        while j < min(time_idx + 12, len(lines)) and len(nums) < 4:
+            if re.match(r"^[\d.,]+[KMB만천]?\+?$", lines[j]):
+                nums.append(parse_count(lines[j]))
+                j += 1
+            elif lines[j] in ("조회수", "Views") or not nums:
+                j += 1
+            else:
+                break
+        if len(nums) >= 3:
+            rec["replies"], rec["reposts"], rec["likes"] = nums[0], nums[1], nums[2]
+            if len(nums) >= 4:
+                rec["bookmarks"] = nums[3]
+    # text: from first @author line (past title block) to time line
+    at_idx = [i for i, l in enumerate(lines)
+              if l == f"@{rec.get('author')}" or re.match(r"^@[A-Za-z0-9_]{1,15}$", l)]
+    if at_idx and time_idx is not None and time_idx > at_idx[0]:
+        rec["text"] = "\n".join(lines[at_idx[0] + 1: time_idx])[:800]
+    elif at_idx and len(at_idx) >= 2:
+        rec["text"] = "\n".join(lines[at_idx[0] + 1: at_idx[0] + 12])[:800]
+
+    # replies (scroll more)
+    replies = []
+    if want_replies:
+        cdp_eval("window.scrollTo(0, 8000)")
+        time.sleep(3)
+        blob2 = cdp_eval("JSON.stringify({t: document.body.innerText})")
+        raw2 = blob2.get("t", "") if isinstance(blob2, dict) else ""
+        replies = parse_replies_text(raw2, rec.get("author"))
+    rec["url"] = f"https://x.com/i/status/{tid}"
+    return rec, replies
+
+
+def parse_replies_text(raw, op_handle):
+    """Parse visible replies out of innerText. Reply shape:
+       'Name' '@handle' '13h' 'text...' ['1.2K views']? '15' '1.2천'  (likes, views)
+    """
+    lines = [l.strip() for l in raw.split("\n") if l.strip()]
+    out = []
+    i = 0
+    while i < len(lines):
+        m = re.match(r"^@([A-Za-z0-9_]{1,15})$", lines[i])
+        if not m or m.group(1) == op_handle:
+            i += 1
+            continue
+        # look ahead for a relative-time marker within 3 lines
+        seg = lines[i: i + 3]
+        tidx = None
+        for j, l in enumerate(seg):
+            if re.match(r"^(\d+[smhdw]|1[0-2]?[smhdw])$", l) or re.match(r"^\d+(시간|분|일|주)\s?(전)?$", l):
+                tidx = j
+                break
+        if tidx is None:
+            i += 1
+            continue
+        handle = m.group(1)
+        name = lines[i - 1] if i > 0 and not lines[i - 1].startswith("@") else None
+        j = i + tidx + 1
+        text_lines = []
+        while j < len(lines) and j < i + 40:
+            l = lines[j]
+            if re.match(r"^@([A-Za-z0-9_]{1,15})$", l):
+                break
+            if re.match(r"^[\d.,]+[KMB만천]?\+?$", l):
+                break
+            if l in ("Show more replies", "모든 답글 보기", "Show more", "Read more"):
+                break
+            text_lines.append(l)
+            j += 1
+        text = "\n".join(text_lines)[:400]
+        # trailing metrics: bare numbers after text (likes, views)
+        likes = views = None
+        k = j
+        metrics = []
+        while k < len(lines) and k < j + 3:
+            if re.match(r"^[\d.,]+[KMB만천]?\+?$", lines[k]):
+                metrics.append(parse_count(lines[k]))
+                k += 1
+            else:
+                break
+        if metrics:
+            likes = metrics[0]
+            if len(metrics) > 1:
+                views = metrics[1]
+        if text or metrics:
+            out.append({"author": handle, "author_name": name, "text": text,
+                        "likes": likes, "views": views,
+                        "url": f"https://x.com/{handle}"})
+        i = max(j, i + 1)
+    # dedup by handle+text
+    seen = set()
+    uniq = []
+    for r in out:
+        k = (r["author"], r["text"][:60])
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(r)
+    return uniq
+
+
+def cdp_user(handle):
+    cdp_open(f"https://x.com/{handle}?lang=en")
+    time.sleep(6)
+    blob = cdp_eval("JSON.stringify({t: document.body.innerText.slice(0, 2500)})")
+    raw = blob.get("t", "") if isinstance(blob, dict) else str(blob or "")
+    if len(raw) < 100 or ("Log in" in raw and "Followers" not in raw):
+        die(3, "engine=cdp: x.com login wall")
+    lines = [l.strip() for l in raw.split("\n") if l.strip()]
+    rec = {"handle": handle, "engine": "cdp",
+           "url": f"https://x.com/{handle}"}
+    # name / handle / posts
+    if lines and lines[0] and not lines[0].startswith("@"):
+        rec["name"] = lines[0]
+    pm = re.search(r"([\d.,]+[KMB만천]?)\s*(?:posts|게시물)", raw)
+    if pm:
+        rec["posts"] = parse_count(pm.group(1))
+    fm = re.search(r"([\d.,]+[KMB만천]?)\s*(?:Followers|팔로워)", raw)
+    if fm:
+        rec["followers"] = parse_count(fm.group(1))
+    im = re.search(r"([\d.,]+[KMB만천]?)\s*(?:Following|팔로잉)", raw)
+    if im:
+        rec["following"] = parse_count(im.group(1))
+    jm = re.search(r"Joined ([A-Z][a-z]{2} \d{4})", raw)
+    if jm:
+        rec["joined"] = jm.group(1)
+    dm = re.search(r"Joined (\d{4}년 \d+월)", raw)
+    if dm:
+        rec["joined"] = dm.group(1)
+    # bio: lines between handle and Joined/followers
+    try:
+        h_idx = next(i for i, l in enumerate(lines) if l == f"@{handle}")
+        end_idx = next((i for i, l in enumerate(lines)
+                        if re.search(r"Followers|팔로워|Joined|가입", l)), len(lines))
+        bio_lines = [l for l in lines[h_idx + 1: end_idx]
+                     if not re.match(r"^[\d.,]+[KMB만천]?$", l)
+                     and l not in ("팔로잉", "팔로워", "Following", "Followers")]
+        if bio_lines:
+            rec["bio"] = " ".join(bio_lines)[:300]
+    except StopIteration:
+        pass
+    # recent tweets (top 3): lines '@handle' + date + text + 4 metrics
+    rec["recent"] = []
+    ats = [i for i, l in enumerate(lines) if l == f"@{handle}"]
+    for a in ats:
+        m = None
+        for j in range(a + 1, min(a + 6, len(lines))):
+            if re.match(r"^[A-Z][a-z]{2} \d{1,2}$", lines[j]) or re.match(r"^\d+[smhdw]$", lines[j]):
+                m = j
+                break
+        if m is None:
+            continue
+        text = "\n".join(lines[m + 1: m + 8])[:200]
+        nums = []
+        for l in lines[m + 1: m + 12]:
+            if re.match(r"^[\d.,]+[KMB만천]?\+?$", l):
+                nums.append(parse_count(l))
+            elif nums:
+                break
+        rec["recent"].append({"text": text, "metrics": nums[:4]})
+        if len(rec["recent"]) >= 3:
+            break
+    return rec
+
+
+GOOGLE_SEARCH_JS = r"""(() => {
+  if (location.href.includes('/sorry/') || /unusual traffic|not a robot/i.test(document.body.innerText)) {
+    return JSON.stringify({captcha: true});
+  }
+  const out = [];
+  const seen = new Set();
+  document.querySelectorAll('a').forEach(a => {
+    const m = a.href.match(/(?:x|twitter)\.com\/([A-Za-z0-9_]+)\/status\/(\d+)/);
+    if (!m) return;
+    const key = m[2];
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({author: m[1], id: m[2], url: a.href.split('?')[0]});
+  });
+  return JSON.stringify({links: out, text: document.body.innerText});
+})()"""
+
+
+def _snippet_items(links, text):
+    items = []
+    for L in links:
+        item = {"id": L["id"], "author": L["author"], "url": L["url"],
+                "engine": "google-cdp"}
+        # snippet: "X<NBSP>·<NBSP>{author}\n{N}+ likes<NBSP>·<NBSP>{when}"
+        m = re.search(
+            r"X[\s\u00a0]·[\s\u00a0]" + re.escape(L["author"]) +
+            r"\n([\d.,]+[KMB만천]?\+?)[\s\u00a0]*likes?[\s\u00a0]·[\s\u00a0]([^\n]+)",
+            text)
+        if m:
+            item["likes_hint"] = parse_count(m.group(1))
+            item["when"] = m.group(2).strip()
+        items.append(item)
+    return items
+
+
+def google_search(query, limit):
+    q = urllib.request.quote(f'site:x.com "{query}"')
+    cdp_open(f"https://www.google.com/search?q={q}&num=20&hl=en")
+    time.sleep(4)
+    blob = cdp_eval(GOOGLE_SEARCH_JS)
+    if not isinstance(blob, dict):
+        die(3, "engine=google-cdp: no payload")
+    if blob.get("captcha"):
+        die(3, "engine=google-cdp: google captcha (rate limit) — retry later")
+    links = blob.get("links", [])
+    text = blob.get("text", "")
+    items = _snippet_items(links, text)
+    if not items:
+        return []
+    return items[:limit]
+
+
+# ---------------------------------------------------------------- output
+
+def out_json(items, engine, wrap=True):
+    if wrap:
+        print(json.dumps({"count": len(items), "engine": engine, "items": items},
+                         ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps(items, ensure_ascii=False, indent=2))
+
+
+def pad(s, w):
+    s = str(s if s is not None else "·")
+    return s[:w - 1] + "…" if len(s) > w else s + " " * (w - len(s))
+
+
+def out_table_tweet(items, footer_engine):
+    print(pad("AUTHOR", 16) + pad("LIKES", 8) + pad("RPL", 7) + pad("VIEWS", 9) + "TEXT")
+    for it in items:
+        print(pad(it.get("author"), 16)
+              + pad(fmt_num(it.get("likes")), 8)
+              + pad(fmt_num(it.get("replies")), 7)
+              + pad(fmt_num(it.get("views")), 9)
+              + (it.get("text") or "").replace("\n", " ")[:90])
+    print(f"engine: {footer_engine} · {len(items)} items")
+
+
+def out_table_generic(items, cols, footer_engine):
+    for c, w in cols:
+        print(pad(c, w), end="")
+    print()
+    for it in items:
+        for c, w in cols:
+            v = it.get(c)
+            if isinstance(v, int):
+                v = fmt_num(v)
+            print(pad(v, w), end="")
+        print()
+    print(f"engine: {footer_engine} · {len(items)} items")
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(prog=TOOL, description="anonymous X/Twitter reader")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("tweet", help="tweet by id/url: text + engagement (+views via --cdp)")
+    p.add_argument("id")
+    p.add_argument("--cdp", action="store_true", help="use CDP engine for views/replies detail")
+    p.add_argument("--replies", action="store_true", help="also list visible replies (CDP)")
+    p.add_argument("--format", default=None)
+    p.add_argument("--fresh", action="store_true")
+
+    p = sub.add_parser("replies", help="visible replies of a tweet (CDP)")
+    p.add_argument("id")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--format", default=None)
+    p.add_argument("--fresh", action="store_true")
+
+    p = sub.add_parser("user", help="user profile: followers, bio, recent posts")
+    p.add_argument("handle")
+    p.add_argument("--format", default=None)
+    p.add_argument("--fresh", action="store_true")
+
+    p = sub.add_parser("search", help="keyword tweet search via google site:x.com (CDP)")
+    p.add_argument("query", nargs="+")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--enrich", action="store_true",
+                   help="also fetch exact like counts via syndication (slower)")
+    p.add_argument("--format", default=None)
+    p.add_argument("--fresh", action="store_true")
+
+    for sp in (p,):
+        pass
+    args = ap.parse_args()
+    fmt = args.format or ("table" if sys.stdout.isatty() else "json")
+    ttl = 0 if args.fresh else 300
+
+    if args.cmd == "tweet":
+        tid = parse_tweet_id(args.id)
+        if not tid:
+            die(2, "tweet: need status id or url")
+        if args.cdp or args.replies:
+            key = f"cdp-tweet:{tid}:{args.replies}"
+            cached = None if ttl == 0 else cache_get(key, ttl)[0]
+            if cached:
+                rec, reps = cached["tweet"], cached["replies"]
+            else:
+                rec, reps = cdp_tweet(tid, args.replies)
+                cache_put(key, {"tweet": rec, "replies": reps}, "cdp")
+            if fmt == "json":
+                out_json([rec], rec.get("engine", "cdp"))
+            else:
+                out_table_tweet([rec], rec.get("engine", "cdp"))
+            if args.replies and reps:
+                if fmt == "json":
+                    print(json.dumps({"replies": reps}, ensure_ascii=False, indent=2))
+                else:
+                    print("\n-- replies --")
+                    out_table_generic(
+                        reps, [("author", 16), ("likes", 7), ("text", 70)], "cdp")
+        else:
+            key = f"synd-tweet:{tid}"
+            cached = None if ttl == 0 else cache_get(key, 86400)[0]
+            if cached:
+                rec = cached
+            else:
+                try:
+                    rec = synd_tweet(tid)
+                except Exception as e:
+                    die(3, f"engine=synd failed: {e}")
+                if rec:
+                    cache_put(key, rec, "synd")
+            if not rec:
+                die(4, f"tweet {tid} not found (syndication)")
+            if fmt == "json":
+                out_json([rec], "synd", wrap=False)
+            elif fmt == "jsonl":
+                print(json.dumps(rec, ensure_ascii=False))
+            else:
+                out_table_tweet([rec], "synd")
+
+    elif args.cmd == "replies":
+        tid = parse_tweet_id(args.id)
+        if not tid:
+            die(2, "replies: need status id or url")
+        key = f"cdp-tweet:{tid}:True"
+        cached = None if ttl == 0 else cache_get(key, ttl)[0]
+        if cached:
+            reps = cached["replies"]
+        else:
+            _, reps = cdp_tweet(tid, True)
+            # store only replies portion is inside cdp-tweet cache anyway
+        if not reps:
+            die(4, "no visible replies (login wall limits depth; try tweet --replies)")
+        reps = reps[:args.limit]
+        if fmt == "json":
+            out_json(reps, "cdp")
+        elif fmt == "jsonl":
+            for r in reps:
+                print(json.dumps(r, ensure_ascii=False))
+        else:
+            out_table_generic(reps, [("author", 16), ("likes", 7), ("text", 72)], "cdp")
+
+    elif args.cmd == "user":
+        handle = parse_handle(args.handle)
+        if not handle:
+            die(2, "user: need @handle or profile url")
+        key = f"cdp-user:{handle.lower()}"
+        cached = None if ttl == 0 else cache_get(key, ttl)[0]
+        if cached:
+            rec = cached
+        else:
+            rec = cdp_user(handle)
+            cache_put(key, rec, "cdp")
+        if fmt == "json":
+            out_json([rec], rec.get("engine", "cdp"), wrap=False)
+        else:
+            for k in ("handle", "name", "bio", "posts", "followers", "following", "joined"):
+                v = rec.get(k)
+                if isinstance(v, int):
+                    v = fmt_num(v)
+                print(f"{k:10} {v if v is not None else '·'}")
+            print("recent:")
+            for t in rec.get("recent", []):
+                print("  ·", (t["text"] or "").replace("\n", " ")[:80])
+            print(f"engine: {rec.get('engine')} · 1 record")
+
+    elif args.cmd == "search":
+        query = " ".join(args.query).strip('"')
+        key = f"ggl:{query}:{args.limit}"
+        cached = None if ttl == 0 else cache_get(key, ttl)[0]
+        if cached:
+            items = cached
+        else:
+            items = google_search(query, args.limit)
+            if items is None:
+                items = []
+            cache_put(key, items, "google-cdp")
+        if not items:
+            die(4, "no tweets indexed for this query (google site:x.com)")
+        if args.enrich:
+            for it in items[:10]:
+                try:
+                    d = synd_tweet(it["id"])
+                    if d:
+                        it.update({k: d[k] for k in
+                                   ("text", "likes", "created_at") if d.get(k)})
+                        it["engine"] = "google-cdp+synd"
+                except Exception:
+                    pass
+                time.sleep(0.4)
+        if fmt == "json":
+            out_json(items, "google-cdp")
+        elif fmt == "jsonl":
+            for it in items:
+                print(json.dumps(it, ensure_ascii=False))
+        else:
+            out_table_generic(
+                items,
+                [("author", 16), ("likes_hint", 10), ("when", 14), ("id", 21)],
+                "google-cdp")
+
+
+if __name__ == "__main__":
+    main()
