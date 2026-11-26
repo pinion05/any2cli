@@ -2,7 +2,7 @@
 
 모든 데이터 소스를 CLI로 래핑하는 방법론 스킬 + 익명 Reddit CLI 예제.
 
-- **웹사이트** → headless Playwright으로 렌더링해서 CLI로
+- **웹사이트** → curl_cffi(HTTP) 또는 zendriver(JS/Cloudflare)로 렌더링해서 CLI로
 - **웹 API** (공식/비공식/RSS/아카이브) → 멀티엔진 폴백 CLI로
 - **데스크톱 앱** → AppleScript/CDP/상태파일로 CLI로
 
@@ -17,7 +17,7 @@ git clone https://github.com/pinion05/any2cli ~/.agents/skills/any2cli
 그러면 "CLI로 만들어줘 / 래핑해줘 / 이 사이트·API·앱을 셸에서 읽고 싶어"류 요청에 스킬이 자동 발동합니다. 핵심 문서:
 
 - [SKILL.md](SKILL.md) — 워크플로우: 분류 → 실측 프로브 → 설계 → 구현 → 검증
-- [references/](references/) — CLI 컨트랙트, API 래핑, Playwright 래핑, 데스크톱 래핑
+- [references/](references/) — CLI 컨트랙트, API 래핑, 브라우저 엔진(실측표), 데스크톱 래핑
 
 ## 대표 예제: 익명 Reddit CLI
 

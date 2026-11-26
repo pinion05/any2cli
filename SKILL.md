@@ -39,7 +39,7 @@ RSS? rendered DOM?) and surviving rate limits, blocks, and schema drift.
 | Source | First probe | Reference |
 |---|---|---|
 | Web API (official or undocumented) | curl the endpoint with a descriptive UA; check auth, rate-limit headers, pagination | [references/api-http.md](references/api-http.md) |
-| Website (HTML only, no API) | headless Playwright; check if data is in initial HTML vs JS-rendered | [references/website-playwright.md](references/website-playwright.md) |
+| Website (HTML only, no API) | check initial HTML first, then hidden XHR; TLS wall → curl_cffi, JS/Cloudflare wall → zendriver | [references/website-playwright.md](references/website-playwright.md) |
 | Desktop app | AppleScript (macOS) / CDP (Electron) / accessibility driver | [references/desktop-apps.md](references/desktop-apps.md) |
 
 Many real sources are hybrids — reddit serves RSS + a community archive API +
@@ -115,9 +115,12 @@ Verification: `examples/reddit/smoke-test.sh` (live-runs every subcommand).
 - Cache aggressively; anything within TTL costs no requests.
 - On 429/403: back off (honor `Retry-After`), then switch engines — never
   retry-loop the same blocked path.
-- Headless browsers: real UA, real viewport, `navigator.webdriver` scrubbed;
-  if a JS challenge still blocks you, the IP is flagged — use a different
-  engine or a mirror, don't fight the challenge.
+- Browsers by wall type: TLS-only → `curl_cffi`; JS/Cloudflare → **zendriver**
+  (measured: 58/58 sannysoft, Cloudflare pass; Playwright and patchright leak
+  `navigator.webdriver` and got HTTP 522). See the engine table in
+  [references/website-playwright.md](references/website-playwright.md).
+- If a challenge still blocks you, the IP is flagged — use a different engine
+  or a mirror, don't fight the challenge.
 
 ## Worked example 2: `ncafe` (read Naver Cafe anonymously)
 
