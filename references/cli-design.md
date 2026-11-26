@@ -57,6 +57,20 @@ archived, primary vs mirror).
   still 429 after retries → **switch engines or exit 3**, never hammer.
   5xx → exponential backoff. 404 → exit 4 immediately, no retry.
 
+### Cache introspection (every tool)
+
+```
+tool cache status [--format json]   # dir, entries, bytes, oldest/newest, TTL
+tool cache clear                    # delete this tool's blobs, print freed count
+```
+
+- Read-only, local-only: no network, exit 0 on an empty/missing cache.
+- `status` reports what the user would lose; `clear` deletes only files inside
+  `~/.cache/any2cli/<tool>/` (never the parent, never another tool's).
+- 20 lines with `os.walk` + `st_size`; no new dependency, no daemon.
+- Report the effective TTL, not the flag default — `--cache-ttl` and the
+  per-source defaults both change it.
+
 ## Process rules
 
 - Single file, executable, `#!/usr/bin/env python3` (or bash/node), stdlib

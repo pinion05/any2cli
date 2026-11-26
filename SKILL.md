@@ -54,6 +54,7 @@ Keep it small enough to memorize; it is what makes wrappers composable:
 ```
 tool <noun> <param> [filters] [--format table|json|jsonl|md]
                         [--limit N] [--fresh] [--cache-ttl SEC] [-v]
+tool cache status|clear
 ```
 
 - **Output**: table when stdout is a tty, JSON when piped. `--format` overrides.
@@ -63,6 +64,9 @@ tool <noun> <param> [filters] [--format table|json|jsonl|md]
 - **Cache + throttle by default.** Disk cache (`~/.cache/any2cli/<tool>/`) with
   TTL; min-interval per host; honor `Retry-After`. A wrapper that hammers a
   source gets its user blocked — that is the #1 way these tools die.
+- **Cache introspection.** `cache status` (dir, entries, bytes, TTL) and
+  `cache clear` (this tool only) ship with every wrapper. Local-only, exit 0 on
+  an empty cache, never a network call.
 - **Stderr is for humans/logs** (engine switches, warnings); stdout stays
   machine-parseable.
 - **No secrets in argv.** Tokens come from env vars or a config file.
